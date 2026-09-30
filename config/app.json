@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "storage": {
+    "database": "data/agent-team.db",
+    "artifacts": "artifacts"
+  },
+  "approval": {
+    "required_phrase": "개발 시작해",
+    "repository_required_phrase": "이 프로젝트 사용 승인해",
+    "repository_approval_ttl_hours": 720,
+    "pending_project_request_ttl_hours": 24
+  }
+}

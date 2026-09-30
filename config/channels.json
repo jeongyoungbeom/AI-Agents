@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "gateway": {
+    "max_processing_attempts": 2,
+    "connection_retry_limit": 8,
+    "retry_max_seconds": 60
+  },
+  "conversation": {
+    "max_auto_agent_replies": 4,
+    "group_parallel_workers": 3,
+    "worker_count": 2,
+    "worker_poll_seconds": 0.2,
+    "lease_seconds": 120,
+    "max_job_attempts": 2
+  },
+  "repository_analysis": {
+    "worker_count": 1,
+    "worker_poll_seconds": 0.5,
+    "lease_seconds": 120,
+    "max_files_per_batch": 3,
+    "max_file_bytes": 49152,
+    "max_batch_bytes": 98304,
+    "max_batches": 40,
+    "max_query_rounds": 80,
+    "max_read_bytes": 4194304,
+    "max_no_progress": 2,
+    "max_elapsed_seconds": 3600
+  },
+  "attachments": {
+    "max_bytes": 8388608,
+    "max_text_characters": 24000
+  },
+  "logging": {
+    "gateway_max_bytes": 5242880,
+    "gateway_backup_count": 14
+  },
+  "telegram": {
+    "private_only": true,
+    "poll_timeout_seconds": 25,
+    "max_message_characters": 3900
+  }
+}

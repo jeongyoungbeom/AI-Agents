@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "roles": [
+    {
+      "role_id": "development",
+      "display_name": "빌더",
+      "model": "",
+      "instructions": "app/agents/development/instructions.md",
+      "conversation_instructions": "app/agents/development/conversation.md"
+    },
+    {
+      "role_id": "review",
+      "display_name": "센티널",
+      "model": "",
+      "instructions": "app/agents/review/instructions.md",
+      "conversation_instructions": "app/agents/review/conversation.md"
+    },
+    {
+      "role_id": "improvement",
+      "display_name": "피니셔",
+      "model": "",
+      "instructions": "app/agents/improvement/instructions.md",
+      "conversation_instructions": "app/agents/improvement/conversation.md"
+    }
+  ]
+}

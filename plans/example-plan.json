@@ -1,0 +1,28 @@
+{
+  "run_id": "CHANGE-ME-001",
+  "repository": {
+    "path": "D:\\PATH\\TO\\YOUR\\GIT-REPOSITORY",
+    "mode": "in_place",
+    "require_clean": true
+  },
+  "branch": "ai/CHANGE-ME-001",
+  "max_improvement_attempts": 2,
+  "stages": [
+    {
+      "id": "STAGE-001",
+      "title": "Replace with the first implementation stage",
+      "objective": "Describe one bounded implementation objective.",
+      "scope": [
+        "src/**",
+        "tests/**"
+      ],
+      "non_goals": [],
+      "acceptance_criteria": [
+        "Describe an observable completion condition."
+      ],
+      "verification_commands": [
+        "git diff --check"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "python-nodejs": {
+      "default": true,
+      "stacks": ["python", "node"],
+      "image": "nikolaik/python-nodejs@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038",
+      "executables": {
+        "python": "3.11",
+        "python3": "3.11",
+        "node": "20",
+        "npm": "9",
+        "npx": "9"
+      },
+      "cache": {"mode": "none"}
+    },
+    "gradle-jdk21": {
+      "default": true,
+      "stacks": ["gradle"],
+      "image": "gradle@sha256:83798adeb903471219ad918aadda1addb6067e2b9bb3e5332e9f3eb1a382bf43",
+      "executables": {
+        "gradle": "8",
+        "java": "21"
+      },
+      "cache": {"mode": "none"}
+    },
+    "gradle-jdk21-controlled-cache": {
+      "stacks": ["gradle"],
+      "image": "gradle@sha256:83798adeb903471219ad918aadda1addb6067e2b9bb3e5332e9f3eb1a382bf43",
+      "executables": {
+        "gradle": "8",
+        "java": "21"
+      },
+      "cache": {
+        "mode": "volume",
+        "marker": "/home/gradle/.gradle/ai-agents-ready",
+        "volume": "ai-agents-gradle-cache-v1",
+        "target": "/home/gradle/.gradle"
+      }
+    }
+  }
+}

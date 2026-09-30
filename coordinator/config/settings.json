@@ -1,0 +1,17 @@
+{
+  "hermes_executable": "D:\\AI-Agents\\hermes-home\\bin\\hermes.exe",
+  "hermes_home": "D:\\AI-Agents\\hermes-home",
+  "provider": "openai-codex",
+  "model": "gpt-5.3-codex",
+  "timeout_seconds": 3600,
+  "reasoning": {
+    "developer": "high",
+    "reviewer": "high",
+    "improver": "high"
+  },
+  "toolsets": {
+    "developer": "coding",
+    "reviewer": "debugging",
+    "improver": "coding"
+  }
+}

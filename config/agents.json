@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "hermes_executable": "hermes-home/bin/hermes.exe",
+  "hermes_home": "hermes-home",
+  "provider": "openai-codex",
+  "execution_isolation": {
+    "backend": "docker",
+    "required": true,
+    "image": "nikolaik/python-nodejs@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038",
+    "network": false,
+    "profile_asset_mounts": false
+  },
+  "timeout_seconds": 3600,
+  "poll_seconds": 0.5,
+  "conversation": {
+    "model": "gpt-6-sol",
+    "reasoning": "xhigh"
+  },
+  "planning": {
+    "model": "gpt-6-sol",
+    "reasoning": "xhigh"
+  },
+  "roles": {
+    "development": {
+      "profile": "developer",
+      "model": "gpt-6-sol",
+      "reasoning": "xhigh",
+      "toolsets": "coding",
+      "max_turns": 160
+    },
+    "review": {
+      "profile": "reviewer",
+      "model": "gpt-6-sol",
+      "reasoning": "xhigh",
+      "toolsets": "debugging",
+      "max_turns": 120
+    },
+    "improvement": {
+      "profile": "improver",
+      "model": "gpt-6-sol",
+      "reasoning": "xhigh",
+      "toolsets": "coding",
+      "max_turns": 160
+    }
+  }
+}

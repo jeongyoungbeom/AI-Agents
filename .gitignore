@@ -1,0 +1,29 @@
+# Local credentials and machine-specific configuration
+config/secrets.env
+config/*.env
+.env
+.env.*
+!*.env.example
+
+# Live state, backups, logs, and generated work
+data/*
+!data/README.md
+artifacts/
+backups/
+logs/
+test-tmp/
+
+# Hermes is a separate Git repository with local changes.
+runtime/
+hermes-home/
+
+# Python and local environments
+**/__pycache__/
+*.pyc
+**/.pytest_cache/
+.venv/
+venv/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*

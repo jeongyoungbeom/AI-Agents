@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "calibration_mode": false,
+  "token_budget": {
+    "conversation": 400000,
+    "per_stage": 300000,
+    "whole_task": 1200000,
+    "completion_reserve": 80000,
+    "provider_input_overhead": 2048,
+    "warning_threshold_percent": 80
+  },
+  "context": {
+    "recent_messages": 12,
+    "recent_decisions": 4,
+    "max_characters": 24000,
+    "decision_summary_characters": 6000
+  },
+  "retention": {
+    "database_ttl_days": 30,
+    "artifact_ttl_days": 30,
+    "attachment_ttl_days": 14,
+    "log_ttl_days": 30,
+    "backup_ttl_days": 30,
+    "max_artifact_bytes": 1073741824,
+    "max_attachment_bytes": 536870912,
+    "backup_count": 7
+  },
+  "retry": {
+    "technical_error": 1,
+    "invalid_response": 1,
+    "verification_failure": 1,
+    "design_rework": 1,
+    "closure_review": 1
+  }
+}
