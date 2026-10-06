@@ -133,7 +133,7 @@ class ReviewHardeningTests(unittest.TestCase):
             self.assertIn("소유자", denied[0].text)
             self.assertEqual(before, len(store.list_messages(binding["run_id"])))
 
-    def test_budget_and_retry_are_forced_around_backend(self):
+    def test_unknown_failure_cost_is_recorded_and_blocks_retry(self):
         with temporary_directory() as directory:
             delegate = ReadyBackend(fail_once=True)
             store, application = build_application(Path(directory), delegate)
@@ -154,7 +154,7 @@ class ReviewHardeningTests(unittest.TestCase):
             binding = store.load_conversation("telegram", "200")
             self.assertGreater(store.usage_total(binding["run_id"]), 0)
             self.assertEqual(
-                1,
+                0,
                 store.retry_count(binding["run_id"], "stage-001", "technical_error"),
             )
 

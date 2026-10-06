@@ -6,6 +6,7 @@ from pathlib import Path
 from app.contracts import RunPhase, StageContract
 from app.gateway.core import AgentReply, IncomingMessage
 from app.services.toolchains import ToolchainPreflightError
+from app.services.git import GitRepository
 from tests.gateway.support import (
     TEST_REPOSITORY_HEAD,
     TEST_REPOSITORY_IDENTITY,
@@ -47,7 +48,9 @@ class _ToolchainPreflight:
         self.calls: list[tuple[Path, tuple[str, ...], str]] = []
 
     def preflight(self, repository, commands, *, operation_id=None, **_kwargs) -> None:
-        self.calls.append((Path(repository), tuple(commands), str(operation_id)))
+        if not isinstance(repository, GitRepository):
+            raise TypeError('실제 ToolchainService는 GitRepository를 받습니다.')
+        self.calls.append((repository.path, tuple(commands), str(operation_id)))
         if self.error is not None:
             raise self.error
 
@@ -58,6 +61,7 @@ def incoming(identifier: str, text: str) -> IncomingMessage:
 
 class ToolchainApprovalTests(unittest.TestCase):
     def _planned_application(self, root: Path, preflight: _ToolchainPreflight):
+        (root / 'selected-repository').mkdir(exist_ok=True)
         scheduler = _PipelineScheduler()
         store, application = build_application(
             root,

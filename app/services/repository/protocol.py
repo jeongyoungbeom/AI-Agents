@@ -20,6 +20,11 @@ from typing import Any
 
 
 _HEX_SHA = re.compile(r"[0-9a-f]{40,64}")
+_PRIVATE_KEY = re.compile(
+    rb"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_PRIVATE_KEY_MASK = bytes(byte if byte in (10, 13) else ord("*") for byte in range(256))
 
 
 class ProtocolError(RuntimeError):
@@ -304,7 +309,30 @@ def _pinned_read(config: dict[str, Any], identity: dict[str, str]) -> dict[str, 
         except UnicodeDecodeError:
             results.append({"path": path, "status": "excluded", "reason": "non_utf8"})
             continue
-        results.append({"path": path, "status": "ok", "data": base64.b64encode(data).decode("ascii")})
+        row = {"path": path, "status": "ok"}
+        if config.get("chunk_bytes"):
+            # 조각 경계 밖의 PEM도 격리 blob 안에서 가리고 원본 byte·CR/LF를 보존한다.
+            data = _PRIVATE_KEY.sub(lambda match: match.group().translate(_PRIVATE_KEY_MASK), data)
+            start = int(entry.get("start_line", 1))
+            cap = int(config["chunk_bytes"])
+            lines = data.splitlines(keepends=True) or [b""]
+            if not 1 <= start <= len(lines) or cap < 1:
+                raise ProtocolError("고정 파일 행 범위가 올바르지 않습니다.")
+            chunk = bytearray()
+            end = start - 1
+            for line in lines[start - 1:]:
+                if len(chunk) + len(line) > cap:
+                    break
+                chunk.extend(line)
+                end += 1
+            if end < start:
+                results.append({"path": path, "status": "excluded", "reason": "line_size_limit"})
+                continue
+            row.update(start_line=start, end_line=end, total_lines=len(lines),
+                       next_line=end + 1 if end < len(lines) else 0)
+            data = bytes(chunk)
+        row["data"] = base64.b64encode(data).decode("ascii")
+        results.append(row)
     return {"identity_hash": identity["identity_hash"], "commit_sha": commit, "results": results}
 
 

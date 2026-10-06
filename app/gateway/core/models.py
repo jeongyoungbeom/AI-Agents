@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
 from app.contracts import RoleId, TokenUsage
+from app.contracts.outcomes import RequestResult
 from app.services.context import ContextBundle
 from app.services.repository import RepositoryToolRequest
+from app.services.message_intent import TaskIntent
 
 
 def _required(value: str, field_name: str, maximum: int = 512) -> str:
@@ -142,6 +144,12 @@ class PollBatch:
 
 
 @dataclass(frozen=True)
+class ConversationResult:
+    messages: tuple[OutgoingMessage, ...]
+    result: RequestResult
+
+
+@dataclass(frozen=True)
 class ProposedStage:
     objective: str
     scope: tuple[str, ...]
@@ -163,11 +171,14 @@ class AgentCallRequest:
     from_role: RoleId
     to_role: RoleId
     purpose: str
+    mode: str = "independent"
 
     def __post_init__(self) -> None:
         if self.from_role == self.to_role:
             raise ValueError("an agent cannot call itself")
         _required(self.purpose, "agent_call.purpose", 2000)
+        if self.mode not in {"independent", "discussion"}:
+            raise ValueError("agent_call.mode must be independent or discussion")
 
 
 @dataclass(frozen=True)
@@ -203,6 +214,11 @@ class AgentReply:
     usage: TokenUsage = field(default_factory=TokenUsage)
     metadata: dict[str, Any] = field(default_factory=dict)
     repository_tools: tuple[RepositoryToolRequest, ...] = ()
+    task_intent: TaskIntent = TaskIntent.ANSWER
+    write_forbidden: bool = False
+    question_purpose: str = ""
+    needs_user_input: tuple[str, ...] = ()
+    execution_intent: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         internal_repository_lookup = (
@@ -212,6 +228,32 @@ class AgentReply:
         )
         if not self.text.strip() and not internal_repository_lookup:
             raise ValueError("agent reply text is required")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "AgentReply":
+        return cls(
+            text=value["text"],
+            stages=tuple(ProposedStage(**{key: tuple(item) if isinstance(item, list) else item
+                                         for key, item in stage.items()})
+                         for stage in value.get("stages", [])),
+            decisions=tuple(value.get("decisions", [])),
+            calls=tuple(AgentCallRequest(RoleId(call["from_role"]), RoleId(call["to_role"]), call["purpose"], call.get("mode", "independent"))
+                        for call in value.get("calls", [])),
+            memory_updates=tuple(MemoryUpdate(MemoryScope(item["scope"]), item["content"],
+                                             RoleId(item["role_id"]) if item["role_id"] else None)
+                                 for item in value.get("memory_updates", [])),
+            usage=TokenUsage(**value["usage"]), metadata=value.get("metadata", {}),
+            repository_tools=tuple(RepositoryToolRequest.from_dict(item)
+                                   for item in value.get("repository_tools", [])),
+            task_intent=TaskIntent(value.get("task_intent", "answer")),
+            write_forbidden=value.get("write_forbidden", False),
+            question_purpose=value.get("question_purpose", ""),
+            needs_user_input=tuple(value.get("needs_user_input", [])),
+            execution_intent=value.get("execution_intent"),
+        )
 
 
 @dataclass(frozen=True)
@@ -224,6 +266,7 @@ class TeamConversationRequest:
     call_purpose: str = ""
     turn_messages: tuple[dict, ...] = ()
     call_index: int = 1
+    reserve_final_answer: bool = False
 
     def __post_init__(self) -> None:
         if self.caller_role == self.role_id:

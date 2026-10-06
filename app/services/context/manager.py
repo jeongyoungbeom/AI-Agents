@@ -48,6 +48,7 @@ class ContextBundle:
     characters: int
     memory_revision: int = 0
     repository_context: dict[str, Any] | None = None
+    evidence: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +59,7 @@ class ContextBundle:
             "characters": self.characters,
             "memory_revision": self.memory_revision,
             "repository_context": self.repository_context or {},
+            "evidence": list(self.evidence),
         }
 
 
@@ -110,6 +112,20 @@ class ContextService:
             "compaction",
             sanitized,
             max_characters=self.policy.decision_summary_characters,
+        )
+
+    def add_repository_evidence(
+        self, run_id: str, *, key: str, content: str, data: dict[str, Any]
+    ) -> bool:
+        """Keep a bounded, attributable excerpt once across queue retries."""
+        if not key.strip() or not data.get("repository_identity") or not data.get("head_sha"):
+            raise ValueError("repository evidence requires a key and snapshot")
+        return self.store.append_message_once(
+            run_id, "repository", "repository_evidence",
+            self.redactor.text(content.strip()),
+            self.redactor.value({**data, "evidence_key": key,
+                                 "untrusted_repository_data": True}),
+            key=key,
         )
 
     def save_memory(
@@ -171,6 +187,7 @@ class ContextService:
         role_id: str = "",
         repository: str = "",
         repository_identity: str = "",
+        repository_head_sha: str = "",
         repository_context: dict[str, Any] | None = None,
         source_messages: Sequence[dict[str, Any]] | None = None,
         exclude_untrusted_repository_messages: bool = False,
@@ -205,8 +222,23 @@ class ContextService:
                 == scoped_identity
             ]
             excluded_for_repository = before_scope_filter - len(messages)
+        if repository_head_sha.strip():
+            messages = [
+                {**item, "data": {**item.get("data", {}),
+                  "stale_repository_snapshot": True}}
+                if any(head != repository_head_sha.strip() for head in (
+                    item.get("data", {}).get("repository_source_heads")
+                    or [item.get("data", {}).get("head_sha", "")]
+                ) if head)
+                else item
+                for item in messages
+            ]
         all_decisions = [message for message in messages if message["kind"] == "decision"]
-        ordinary = [message for message in messages if message["kind"] != "decision"]
+        evidence_candidates = [message for message in messages
+                               if message["kind"] == "repository_evidence"
+                               and not message.get("data", {}).get("stale_repository_snapshot")]
+        ordinary = [message for message in messages
+                    if message["kind"] not in {"decision", "repository_evidence"}]
         candidates = ordinary[-recent_limit:]
         memory_keys = [] if scoped_identity else [("run", run_id)]
         if conversation_key.strip():
@@ -221,6 +253,7 @@ class ContextService:
         decisions: list[dict[str, Any]] = []
         memories: list[dict[str, Any]] = []
         selected: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
         sanitized_repository_context = self.redactor.value(repository_context or {})
         repository_size = (
             len(
@@ -253,13 +286,15 @@ class ContextService:
             used += size
         decisions.reverse()
 
-        for memory in all_memories:
-            size = len(memory["content"])
+        # Reserve source locations before chat excerpts can consume the cap.
+        for item in reversed(evidence_candidates[-12:]):
+            size = len(json.dumps(item["data"], ensure_ascii=False))
             if used + size > max_characters:
                 truncated = True
                 continue
-            memories.append(memory)
+            evidence.append(dict(item))
             used += size
+        evidence.reverse()
 
         for message in reversed(candidates):
             size = len(message["content"])
@@ -269,6 +304,21 @@ class ContextService:
             selected.append(message)
             used += size
         selected.reverse()
+        for index, item in enumerate(evidence):
+            available = (max_characters - used) // (len(evidence) - index)
+            excerpt = item["content"][:min(1600, available)]
+            used += len(excerpt)
+            if len(excerpt) < len(item["content"]):
+                truncated = True
+            item["content"] = excerpt
+        truncated = truncated or len(evidence_candidates) > len(evidence)
+        for memory in all_memories:
+            size = len(memory["content"])
+            if used + size > max_characters:
+                truncated = True
+                continue
+            memories.append(memory)
+            used += size
         return ContextBundle(
             decisions=tuple(decisions),
             memories=tuple(memories),
@@ -279,4 +329,5 @@ class ContextService:
                 (int(memory["revision"]) for memory in memories), default=0
             ),
             repository_context=sanitized_repository_context,
+            evidence=tuple(evidence),
         )

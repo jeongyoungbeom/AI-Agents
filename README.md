@@ -1,298 +1,182 @@
-# AI 에이전트 시스템
+# AI-Agents
 
-집에서 먼저 사용하고 나중에 확장할 수 있도록, 빌더(개발)·센티널(리뷰)·피니셔(보완) 역할을 서로 분리해 만드는 프로젝트다.
+**Telegram에서 대화하며 로컬 Git 프로젝트의 개발·리뷰·보완을 진행하는 AI 에이전트 시스템입니다.**
 
-## 개발 순서
+아이디어를 이야기하고, 프로젝트를 함께 살펴보고, 승인한 계획에 따라 코드를 수정합니다. 개발·리뷰·보완은 서로 다른 역할이 맡고, 작업 상태와 대화는 SQLite에 저장해 중지와 재개를 지원합니다.
 
-1. 기반 구조 — 완료
-2. 공통 대화 게이트웨이와 텔레그램 어댑터 — 완료
-3. 개발 → 리뷰 → 보완 에이전트 파이프라인 — 완료
-4-A. 자유 대화 기반 — 완료
-4-B. 세 에이전트 자유 대화와 상호 호출 — 완료
-4-B.1. 역할 의미 교정과 리뷰 결과별 파이프라인 분기 — 완료
-4-B.2. 대화 응답 속도와 그룹 호출 병렬화 — 완료
-4-C. 실제 사용 테스트와 안정화 — 완료
-5-A. 프로젝트·작업 상태 분리 — 완료
-5-B. 안전한 프로젝트 조회와 저장소 식별 승인 — 완료
-5-C. 자유 대화용 안전한 파일 검색·상세 코드 조회 도구 — 완료
-5-D. Telegram 전체 흐름 통합 테스트와 운영 안정화 — 완료
-E-1~E-5. 자연어·문맥·협업·승인·Docker 안전장치 — 완료
-E-6. 비용·로그·운영 기능 — 완료
-E-7. 첨부파일과 로컬 종단 테스트 — 완료
+> **개발 중인 프로젝트입니다.** 핵심 기능 구현과 회귀 테스트를 진행했으며, 실제 Telegram 환경의 전체 수용 검증은 아직 완료되지 않았습니다. 현재 실행 구성은 Windows의 `D:\AI-Agents`와 별도로 수정한 Hermes 런타임을 기준으로 합니다. 이 저장소만 복제해서 바로 실행할 수 있는 배포판은 아닙니다.
 
-현재는 Telegram에서 빌더·센티널·피니셔와 각각 자유롭게 대화할 수 있다. 필요한 경우 에이전트가 다른 에이전트를 직접 불러 의견을 이어가며, 실제 개발 요청은 별도의 설계·승인·개발·리뷰·보완·검증 흐름으로 전환된다. 5-C까지 완료되어 자유 대화에서도 승인한 Git 프로젝트의 커밋된 구조를 보고, 필요한 파일을 제한적으로 검색하고, 지정한 줄의 상세 코드를 확인한 뒤 근거 있는 작업을 제안할 수 있다. 5-D와 E-7은 Telegram 입력 형식·첨부파일 안전 처리부터 로컬 Git 기반 완료까지 실제 게이트웨이·SQLite 큐·검증 실행기를 연결해 점검하며, GitHub push와 PR은 범위에서 제외한다.
+## 세 에이전트의 역할
 
-## 폴더 구조
+| 에이전트 | 역할 | 하는 일 |
+| --- | --- | --- |
+| 빌더 | 설계·개발 | 요구사항을 구체화하고 코드를 구현합니다. |
+| 센티널 | 독립 리뷰 | 설계와 구현을 검토하고 문제의 종류와 심각도를 판단합니다. |
+| 피니셔 | 보완 | 리뷰에서 발견한 구현 문제를 수정합니다. |
+
+자유 대화에서는 원하는 역할을 부르거나 `얘들아`, `셋 다`로 함께 이야기할 수 있습니다. 개발 작업은 리뷰 결과에 따라 빌더 재작업 또는 피니셔 보완으로 이어지며, 문제가 없으면 보완 단계를 생략합니다.
+
+## 주요 기능
+
+- **자연어 대화:** 별도의 작업 명령 형식 없이 질문과 개발 요청을 보냅니다.
+- **프로젝트 조회:** 승인한 Git 저장소의 커밋된 코드에서 파일 검색, 상세 읽기, 장기 분석을 수행합니다.
+- **계획과 실행 승인:** 프로젝트 사용과 코드 변경을 각각 명시적으로 승인합니다.
+- **개발 파이프라인:** 단계별 개발 → 독립 리뷰 → 필요한 보완 → 검증을 실행합니다.
+- **중지와 재개:** 대화, 질문, 중간 지시, 작업 공간과 결과를 저장해 다음 안전 지점에서 이어갑니다.
+- **사용량 관리:** 역할별 토큰 사용량, 예산 경고와 재시도 기록을 확인합니다.
+- **첨부파일 처리:** 허용된 UTF-8 텍스트 문서와 사진을 대화의 참고자료로 사용합니다.
+
+현재 제공하는 실제 채널은 Telegram입니다. 다른 채널은 공통 `ChatAdapter` 인터페이스로 확장할 수 있습니다.
+
+## 사용 흐름
 
 ```text
-D:\AI-Agents\
-├─ app\
-│  ├─ gateway\       공통 대화 처리와 채널별 어댑터
-│  ├─ agents\        개발·리뷰·보완 역할별 지침
-│  ├─ pipeline\      개발 → 리뷰 → 보완 → 검증 실행
-│  ├─ orchestrator\  승인과 작업 단계 상태 관리
-│  ├─ contracts\     단계 계획과 역할 간 인계 형식
-│  ├─ services\      문맥, 토큰, 재시도, 로그, 안전한 저장소 조회
-│  └─ storage\       SQLite 체크포인트와 산출물
-├─ config\           일반 설정과 사용자가 채울 비밀 설정
-├─ data\attachments\ Telegram에서 안전 검사를 통과한 첨부파일의 전용 보관소
-├─ tests\            단계별 자동 테스트
-├─ scripts\          실행·검증 명령
-├─ artifacts\        작업별 계획, 로그, 인계 결과
-└─ coordinator\      이전 명령형 실행기
+자유 대화 → 프로젝트 선택·승인 → 계획 검토·승인
+         → 빌더 개발 → 센티널 리뷰 → 필요한 재작업·보완
+         → 검증 → 검증된 결과를 로컬 저장소에 반영
 ```
 
-## 대화 방식
-
-평범한 대화는 프로젝트 없이 시작한다. 이름을 부르면 해당 역할, 이름이 없으면 마지막 대화 상대, `얘들아` 또는 `셋 다`라고 하면 세 역할이 답한다. 에이전트가 다른 역할의 의견이 필요하다고 판단하면 `[빌더 → 센티널]`처럼 호출 이유를 보여준 뒤 대화를 이어간다.
-
-자유 대화는 매번 독립 Hermes 호출로 실행하고, 최근 대화·확정 결정·범위별 기억만 제한된 크기로 다시 넣는다. 따라서 세션 전체가 끝없이 커지지 않는다. 한 사용자 메시지에서 자동 에이전트 답변은 최대 4회이며, 같은 방향의 반복 호출은 차단한다.
-
-`얘들아` 또는 `셋 다`로 직접 부른 세 역할의 첫 답변은 최대 3개 프로세스로 동시에 실행한다. 사용자가 보는 출력 순서는 빌더 → 센티널 → 피니셔로 고정하고, 앞선 답변을 문맥으로 사용해야 하는 에이전트 간 후속 호출은 순서대로 처리한다. 한 역할이 실패해도 다른 역할의 정상 답변은 버리지 않는다. 모델은 대화용 Terra, 추론 강도는 `xhigh`를 그대로 사용하므로 토큰 품질 설정은 바뀌지 않는다.
-
-긴 자유 대화는 SQLite 대화 큐에 먼저 저장한다. 기본 2개의 대화 워커가 서로 다른 대화는 병렬로 처리하지만 같은 대화방은 FIFO 순서를 지킨다. 진행 카드는 최초 한 건만 전송하고 이후 갱신은 같은 카드 편집 요청을 합쳐 보관한다. 워커가 모델 호출 뒤 종료되면 저장된 응답을 다시 실행하지 않고 복구하며, 결과를 확인할 수 없으면 `NEEDS_ATTENTION` 상태로 남긴다. worker 수와 대화 작업 최대 시도 횟수는 `config\channels.json`의 `conversation.worker_count`, `conversation.max_job_attempts`에서 조정한다.
-
-개발 요청도 `/task` 같은 형식이 아니라 평소처럼 말한다. 자유 대화에서 이미 합의한 최근 대화와 결정은 새 개발 작업의 문맥으로 제한된 크기 안에서 자동 인계된다. 저장소를 바꾼 뒤에는 이전 저장소 대화가 새 저장소 작업에 섞이지 않는다. 반대로 `새 작업`은 이전 개발 작업을 이어받지 않는 별도 작업으로 시작하며, 처리 대기 중이던 이전 대화도 취소한다.
+Telegram에서 다음과 같이 시작할 수 있습니다.
 
 ```text
-사용자: 로그인 기능을 추가하고 싶어
-게이트웨이: 사용할 Git 프로젝트의 절대경로를 보내 주세요.
-사용자: C:\projects\sample
-```
+빌더야, 로그인 기능을 추가하고 싶어
+C:\projects\sample
+이 프로젝트 사용 승인해
 
-프로젝트 경로는 설정에 고정하지 않는다. 작업할 때마다 원하는 로컬 Git 저장소의 절대경로를 대화로 지정한다. 처음 선택한 저장소는 사용자별로 정확히 `이 프로젝트 사용 승인해`라는 확인을 한 번 더 받아야 한다.
-
-프로젝트 경로는 개발 요청 전의 자유 대화에서도 바로 보낼 수 있다. `센티널아 C:\My Project\sample 이 프로젝트를 정리해줘`처럼 경로와 질문을 한 문장에 함께 보내도 된다. 처음 보는 프로젝트의 경로+질문은 승인 전까지 안전하게 보류하고, 승인 뒤 영속 대화 큐에서 이어서 처리한다. 보류 요청은 24시간 뒤 자동 취소되며 `중지` 또는 `새 작업`도 함께 취소한다. 승인은 채널·대화·사용자·저장소 식별값 단위로 30일간 유지되며, 만료되거나 같은 경로의 저장소가 바뀌면 다시 승인해야 한다. 자유 대화 에이전트는 범용 파일·셸 도구를 직접 받지 않는다. 안전한 조회 계층이 현재 커밋 `HEAD`에서 선별한 구조와 관련 파일을 먼저 전달하고, 정보가 부족할 때만 구조화된 `search_files`·`read_file` 요청을 검증해 같은 커밋에서 실행한다. 환경파일·인증정보·개인키·바이너리·대용량 파일은 제외하고 전달 전 비밀값을 한 번 더 제거한다. 검색은 리터럴 문자열과 제한된 파일·바이트·결과 수만 허용하고, 상세 읽기는 정확한 상대경로와 제한된 줄 범위만 허용한다.
-
-한 답변에서 저장소 도구 요청은 최대 3개, 상세 조회 왕복은 최대 2회이며 기존 메시지당 실제 모델 호출 4회 제한 안에서만 진행한다. 조회 도중 `HEAD`가 바뀌면 서로 다른 커밋의 내용을 섞지 않고 결과를 폐기한 뒤 다시 질문하도록 안내한다.
-
-저장소 내용을 사용한 답변에서도 사용자가 **현재 메시지에서** 다른 에이전트·역할의 검토나 의견을 요청한 경우에만 다른 역할에게 독립 검토를 요청할 수 있다. README·코드 주석 같은 비신뢰 저장소 데이터는 역할 호출의 목적에 전달하지 않고, 안전 중개 계층이 고정된 검토 문구로 바꾼다. 명령·비밀값·시스템 지시 표현이 포함된 호출은 차단하며, 저장소 문맥에서 장기 기억을 저장할 수 없다. 저장소에서 유래한 답변은 출처 표지를 유지하고, 저장소 문맥이 없는 이후 일반 대화에는 다시 넣지 않는다.
-
-계획이 준비된 뒤 실제 실행 승인은 정확히 다음 문장으로만 받는다.
-
-```text
+계획에서 세션 만료 테스트도 포함해줘
 개발 시작해
 ```
 
-`상태`, `중지`, `재개`, `새 작업`, `도움말`은 보조 기능으로 사용할 수 있다. 계획 답변에는 단계별 수정 범위·완료 조건·검증 명령·제외 범위를 함께 표시하며, 계획 수정 의견을 보내면 새 계획 버전으로 다시 작성한다. 실행 중 역할이 제품 결정을 물으면 질문을 영속 저장하고 Telegram으로 전달한다. 답변을 보내면 그 답변을 다음 실행 문맥에 반영한 뒤 현재 단계를 안전한 시작 지점에서 다시 큐에 넣는다. `중지`는 실행 중인 작업에 안전한 일시 중지를 요청하고, 중지가 완료된 뒤 `재개`로 이어갈 수 있다. 일시 중지 상태에서 다시 `중지`하면 작업을 종료한다.
+프로젝트를 읽는 승인 문장은 `이 프로젝트 사용 승인해`, 계획을 실행하는 승인 문장은 `개발 시작해`입니다. 계획이 바뀌면 다시 실행 승인을 받습니다.
 
-`사용량`, `토큰`, `/usage`도 `상태`처럼 바로 쓸 수 있다. 작업·현재 단계·자유 대화의 실제/추정 토큰 합계와 현재 한도를 표시한다.
+| 메시지 | 기능 |
+| --- | --- |
+| `센티널아, 이 코드를 검토해줘` | 원하는 역할에게 요청 |
+| `얘들아, 이 설계에 대해 의견 줘` | 세 역할의 의견 요청 |
+| `상태` / `사용량` | 진행 상태와 토큰 사용량 확인 |
+| `중지` / `재개` | 실행 중 작업의 안전한 일시 중지와 재개 |
+| `새 작업` | 현재 프로젝트에서 별도의 작업 시작 |
+| `도움말` | 지원하는 대화 기능 확인 |
 
-`새 작업`은 이전 작업 목표와 계획·실행 승인을 이어받지 않는다. 현재 프로젝트와 마지막 대화 상대는 대화 세션 상태이므로 유지되며, 새 작업은 선택된 프로젝트의 새 작업 ID로 시작한다.
+## 실행 준비
 
-## 대화 채널 교체
+### 필요한 환경
 
-현재 Telegram 어댑터를 제공하지만 내부 대화 처리는 Telegram에 종속되지 않는다.
+- Windows와 PowerShell, Git
+- Docker Desktop의 Linux engine과 설정에 지정된 이미지
+- 프로젝트용으로 수정한 Hermes 런타임과 해당 Python 가상환경
+- Hermes의 `openai-codex` 인증 및 Telegram 봇 토큰
 
-```text
-Telegram ─┐
-Discord ──┤
-Slack ────┼→ 공통 대화 게이트웨이 → 에이전트 시스템
-웹 채팅 ──┤
-CLI ──────┘
+**Hermes는 별도로 준비해야 합니다.** 현재 어댑터는 구조화된 결과 파일, 실제 사용량 보고, 도구 없는 대화, 작업 공간 정책 등의 로컬 수정에 의존합니다. 일반 upstream Hermes로 그대로 대체할 수 없으며, 런타임·가상환경·인증 파일은 이 저장소에 포함하지 않습니다. 세부 계약은 [Hermes 어댑터 설명](app/services/hermes/README.md)을 참고하세요.
+
+### 1. 소스와 런타임 준비
+
+```powershell
+git clone https://github.com/jeongyoungbeom/AI-Agents.git D:\AI-Agents
+Set-Location D:\AI-Agents
 ```
 
-새 채널은 공통 `ChatAdapter` 인터페이스를 구현해서 추가한다. 채널을 바꿔도 작업 상태, 대화 기록, 승인 규칙과 에이전트 파이프라인은 그대로 유지된다.
-
-## 텔레그램 설정
-
-비밀값은 의도적으로 비워 두었다. 다음 파일에 사용자가 직접 입력한다.
-
-`D:\AI-Agents\config\secrets.env`
+스크립트의 기본 경로는 `D:\AI-Agents`입니다. 다른 위치를 사용하려면 `scripts/`의 경로 설정도 맞춰야 합니다. 다음 실행 파일이 있는지 확인하세요.
 
 ```text
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_ALLOWED_USERS=
+runtime/hermes-agent/venv/Scripts/python.exe
+runtime/hermes-agent/venv/Scripts/pythonw.exe
+hermes-home/bin/hermes.exe
+```
+
+### 2. Telegram 설정
+
+예시 파일을 복사합니다. 이미 설정한 파일은 덮어쓰지 않습니다.
+
+```powershell
+if (-not (Test-Path .\config\secrets.env)) {
+    Copy-Item .\config\secrets.env.example .\config\secrets.env
+}
+```
+
+`config/secrets.env`에 다음 값을 입력합니다.
+
+```dotenv
+TELEGRAM_BOT_TOKEN=<BotFather에서 발급받은 토큰>
+TELEGRAM_ALLOWED_USERS=<허용할 숫자 사용자 ID>
 TELEGRAM_ALLOWED_CHATS=
 ```
 
-- `TELEGRAM_BOT_TOKEN`: BotFather에서 발급받은 봇 토큰
-- `TELEGRAM_ALLOWED_USERS`: 사용할 Telegram 숫자 사용자 ID, 여러 명이면 쉼표로 구분
-- `TELEGRAM_ALLOWED_CHATS`: 그룹 사용 시 허용할 채팅 ID. 현재 기본값은 개인 채팅 전용이므로 비워 둔다.
+사용자 ID가 여러 개면 쉼표로 구분합니다. 기본 구성은 개인 채팅 전용이므로 `TELEGRAM_ALLOWED_CHATS`는 비워 둡니다. 예시의 `GIT_ACCESS_TOKEN`은 현재 로컬 개발 흐름에 필요하지 않습니다.
 
-비밀 설정 파일은 `.gitignore`에 포함되어 있다. 토큰과 인증 정보는 로그에 기록하기 전에 제거한다.
+### 3. 인증과 실행
 
-## 첨부파일
-
-Telegram에서 문서 또는 사진을 설명과 함께 보내거나, 파일만 보내도 된다. 파일만 보낸 경우에는
-문서는 요약, 사진은 설명 요청으로 처리한다. 지원 형식은 UTF-8 텍스트 문서(`.md`, `.txt`,
-코드·설정·로그·CSV·JSON·YAML 등)와 PNG/JPEG/GIF/WebP 사진이며, 기본 최대 크기는 8MiB다.
-
-- 파일은 Telegram의 `getFile` 경로만 사용해 `data\attachments\` 아래에 내려받는다. 경로 이탈, 크기 초과, 빈 파일, 실행·압축·OLE 바이너리 서명, UTF-8이 아닌 텍스트, 허용하지 않은 확장자는 모델 문맥에 넣지 않는다.
-- 문서는 최대 24,000자만 넣고 `사용자 제공 비신뢰 데이터`로 표시한다. 문서 안의 명령·프롬프트·역할 호출은 지시가 아니라 참고 내용으로만 해석한다.
-- 사진은 서명·저장 경로·SHA-256을 재검사한 경우에만 Hermes에 전달한다. 파일을 실행하거나 셸 도구에 넘기지 않는다.
-- 이 검사는 실행·압축·프롬프트 주입을 막는 정적 안전 검사다. 백신 엔진의 악성코드 판정은 아직 연결하지 않았으므로, 신뢰할 수 없는 실행 파일·압축 파일은 보내지 않는 것이 원칙이다.
-
-크기와 문서 문맥 한도는 `config\channels.json`의 `attachments.max_bytes`,
-`attachments.max_text_characters`에서 조정한다. 허용 범위는 각각 1KiB~20MiB, 1,000~100,000자다.
-
-## 실행과 검증
-
-1~4-B 전체 자동 테스트:
+준비된 Hermes 실행 파일로 인증한 뒤 구성과 연결을 확인합니다.
 
 ```powershell
-D:\AI-Agents\scripts\pipeline-check.ps1
+.\scripts\finish-auth.ps1
+.\scripts\chat-gateway.ps1 check -Offline
+.\scripts\chat-gateway.ps1 check
+.\scripts\chat-gateway.ps1 run
 ```
 
-비밀값 입력 후 로컬 설정 확인:
+`check -Offline`은 Telegram 네트워크 연결을 생략하지만 로컬 DB 초기화·마이그레이션과 로그 기록을 수행합니다. Docker 이미지와 런타임이 준비되지 않으면 점검과 도구 실행은 중단됩니다.
+
+## 설정 파일
+
+| 파일 | 설정 내용 |
+| --- | --- |
+| [agents.json](config/agents.json) | provider, 모델, 추론 강도, 역할 프로필, 실행 격리 |
+| [roles.json](config/roles.json) | 에이전트 표시 이름과 역할별 지침 |
+| [app.json](config/app.json) | 저장 경로와 승인 규칙 |
+| [channels.json](config/channels.json) | Telegram, 워커, 첨부파일과 분석 범위 |
+| [limits.json](config/limits.json) | 토큰 예산, 재시도와 보관 정책 |
+| [toolchains.json](config/toolchains.json) | 검증에 사용할 Docker 이미지와 실행 도구 |
+
+## 운영과 복구
 
 ```powershell
-D:\AI-Agents\scripts\chat-gateway.ps1 check -Offline
+.\scripts\chat-gateway.ps1 start    # 백그라운드 실행
+.\scripts\chat-gateway.ps1 status   # 실행 상태
+.\scripts\chat-gateway.ps1 logs     # 최근 로그
+.\scripts\chat-gateway.ps1 stop     # 워커와 하위 프로세스를 정리한 뒤 종료
+.\scripts\chat-gateway.ps1 restart  # 안전 종료 후 다시 시작
+.\scripts\chat-gateway.ps1 backup   # SQLite 백업
 ```
 
-Telegram 연결 확인:
+대화와 작업 상태는 `data/agent-team.db`, 작업별 기록은 `artifacts/`, 전역 로그는 `logs/`에 저장합니다. 백업·정리·복구는 [저장소 설명](app/storage/README.md)과 [보관 정책](config/limits.json)을 참고하세요.
+
+토큰 예산은 호출 전 예약하고 보고된 사용량으로 정산합니다. 예약량은 provider 비용의 강제 상한이 아닙니다. 사용량을 확인할 수 없는 중단이나 초과가 발생하면 비용과 작업 결과를 보존하고 확인 필요 상태로 멈춥니다. 작업 소유자는 `/budget_reset`, `/budget_ack 이벤트ID 실제보고토큰`, `/resume`으로 확인된 작업을 이어갈 수 있습니다. 이 명령은 계정 사용 한도나 credit을 변경하지 않습니다. 상세 재개 조건은 [파이프라인 설명](app/pipeline/README.md)에 있습니다.
+
+## 검증
+
+준비된 로컬 환경에서 다음 검증 명령을 사용할 수 있습니다.
 
 ```powershell
-D:\AI-Agents\scripts\chat-gateway.ps1 check
+.\scripts\foundation-check.ps1  # 설정·상태·예산 등 기반 검증
+.\scripts\gateway-check.ps1     # 기반 + 대화 게이트웨이 검증
+.\scripts\pipeline-check.ps1    # 기반 + 게이트웨이 + 개발 파이프라인 검증
+.\scripts\f7-validation.ps1     # 로컬 fixture 기반 통합 검증
 ```
 
-게이트웨이 실행:
+이 검증들은 실제 모델과 Telegram을 호출하지 않는 대역·로컬 fixture를 사용합니다. 실제 Docker 경계 검증은 준비된 이미지가 있을 때 `f7-validation.ps1 -Docker`로 실행합니다. 실제 Telegram·provider 수용 검증은 별도로 진행하며, 자동 테스트 통과만으로 완료를 판단하지 않습니다.
 
-```powershell
-D:\AI-Agents\scripts\chat-gateway.ps1 run
+## 프로젝트 구조
+
+```text
+app/
+├─ gateway/       대화 처리, Telegram 어댑터와 워커
+├─ agents/        빌더·센티널·피니셔의 실행 지침과 응답 처리
+├─ pipeline/      개발·리뷰·보완·검증 파이프라인
+├─ orchestrator/  승인과 작업 상태 전환
+├─ contracts/     계획과 역할 간 인계 형식
+├─ services/      문맥, 예산, Git, Hermes, 격리와 검증
+└─ storage/       SQLite 상태와 산출물 저장
+config/           공개 설정과 비밀 설정 예시
+scripts/          실행·운영·검증 명령
+tests/            회귀 테스트와 로컬 fixture
+coordinator/      이전 명령형 실행기
 ```
 
-백그라운드 운영:
+전체 구성은 [앱 구조](app/README.md), 대화 확장은 [게이트웨이](app/gateway/README.md), 코드 조회는 [저장소 조회 서비스](app/services/repository/README.md)에 설명되어 있습니다. [이전 실행기](coordinator/README.md)는 `-AllowLegacy`를 명시해야 실행됩니다.
 
-```powershell
-D:\AI-Agents\scripts\chat-gateway.ps1 start
-D:\AI-Agents\scripts\chat-gateway.ps1 status
-D:\AI-Agents\scripts\chat-gateway.ps1 logs
-D:\AI-Agents\scripts\chat-gateway.ps1 logs -RunId <실행-ID>
-D:\AI-Agents\scripts\chat-gateway.ps1 stop
-D:\AI-Agents\scripts\chat-gateway.ps1 restart
-```
+## 코드 변경 경계
 
-`stop`은 강제 종료하지 않는다. 중지 요청 파일을 보내고 게이트웨이가 Hermes·검증·발신 워커를 정리한 뒤 종료될 때까지 기다린다. Windows 시작 자동 등록은 아직 하지 않는다. 필요해질 때 별도 명령으로 추가한다.
+자유 대화는 승인된 저장소의 커밋된 코드를 제한적으로 읽습니다. 개발·보완은 승인한 범위의 임시 Git worktree에서 수행하고, 모든 단계의 리뷰와 검증을 통과한 결과만 원본 상태를 다시 확인한 뒤 반영합니다. Docker 도구 실행에는 네트워크와 호스트 자격증명을 전달하지 않습니다. 앱의 개발 흐름은 로컬 커밋과 반영까지 지원하며 GitHub push·PR·배포는 자동 실행하지 않습니다.
 
-## 비용과 운영 로그
-
-- `config\limits.json`은 calibration에서 확인한 자유 대화 29회(호출당 최대 약 9.7k 토큰)를 근거로 hard limit을 적용한다. 대화 48k, 단계 32k, 전체 작업 128k이며 완료·오류 안내를 남길 8k reserve를 전체 한도에서 먼저 보존한다. 호출 전에는 실제 전송 prompt 전체를 UTF-8 byte 기준 상한으로 계산하고 `provider_input_overhead`까지 예약하며, Hermes의 output cap도 함께 적용한다. 한도를 바꾸려면 같은 파일의 다섯 값을 함께 조정한다.
-- Hermes의 역할 실행은 실행별 `*-usage.json`에 보고한 실제 토큰을 우선 기록한다. 제공자가 사용량을 주지 않은 경우에만 문자 수 기반 추정치로 기록하며 Telegram 상태에 실제/추정이 구분되어 보인다.
-- 설정된 한도의 기본 80%에 처음 도달하면 대화·단계·전체 작업별로 한 번만 Telegram 경고를 보낸다. 정확한 비율은 `token_budget.warning_threshold_percent`에서 바꾼다.
-- 전역 연결·큐 오류는 `logs\gateway.log`에 JSONL로 남고 5 MiB마다 회전한다. 최근 14개 보관본(`gateway.log.1`~`.14`)이 자동 백업·보관본이다. 크기와 개수는 `config\channels.json`의 `logging`에서 조정한다.
-- 작업별 경로 인식·프로젝트 승인·라우팅·역할 호출·재시도·검증 오류는 `artifacts\<실행-ID>\events.jsonl` 및 `timeline.log`에 즉시 기록된다. 실행 ID는 Telegram `상태`에서 확인한다.
-- context는 최근 메시지 12개, 최근 확정 결정 4개, 프로젝트별 기억과 6k 크기의 확정 결정 요약을 분리해 최대 24k 문자 안에서 구성한다. 사용자는 Telegram에서 `기억 조회`, `기억 수정: 내용`, `기억 삭제`로 자신의 장기 기억을 직접 관리할 수 있다.
-- 모델·reasoning 설정은 `config\agents.json`만 사용한다. `config\roles.json`은 표시 이름과 지시 파일만 담아 모델 설정을 중복하지 않는다.
-
-## 인증 파일과 보관 운영
-
-- `config\secrets.env`, `hermes-home\auth.json`, `auth.lock`, `state.json`은 `secure` 명령이 현재 Windows 사용자와 `SYSTEM`에만 Full Control을 주고 상속 ACL을 제거한다. Hermes가 파일을 직접 읽어야 하므로 별도 앱 암호화는 적용하지 않는다.
-- 보관 정책은 `config\limits.json`의 `retention`에 있다. 만료된 `SENT`/`DEAD` outbox, 수신·대화 큐 기록, 이벤트·메시지, 로그, 완료 실행 artifact/recovery, 첨부파일과 완료·실패·취소된 task의 SQLite 원장·계획·재시도·예약 row를 정리하며 실행 중·일시중지·확인 필요 실행은 보존한다. artifact는 1 GiB, 첨부파일은 512 MiB를 넘으면 오래된 항목부터 추가 정리한다.
-- `purge`는 먼저 SQLite 일관성 백업을 만들고 게이트웨이가 중지된 경우에만 실행한다. `restore`도 게이트웨이가 중지된 경우에만 `data\backups` 아래의 검증된 백업으로 복구한다.
-
-```powershell
-D:\AI-Agents\scripts\chat-gateway.ps1 secure
-D:\AI-Agents\scripts\chat-gateway.ps1 backup
-D:\AI-Agents\scripts\chat-gateway.ps1 purge
-D:\AI-Agents\scripts\chat-gateway.ps1 restore -Backup data\backups\agent-team-<UTC 시간>.db
-```
-
-전체 회귀 테스트와 설치 상태는 다음 명령으로 점검한다. 기본값은 Telegram 네트워크를
-사용하지 않으며, 실제 봇 연결까지 확인하려면 `-Online`을 붙인다. 메시지를 보내지는 않는다.
-
-```powershell
-D:\AI-Agents\scripts\operational-check.ps1
-D:\AI-Agents\scripts\operational-check.ps1 -Online
-```
-
-5-D의 종단 간 운영 흐름만 빠르게 점검하려면 다음을 실행한다. 기본값은 실제 Telegram
-메시지를 보내지 않고 설치 상태를 오프라인으로 확인한 뒤, Telegram 형식 입력·프로젝트
-선택·설계·승인·개발·리뷰·보완·검증을 임시 로컬 Git 저장소에서 수행한다. 승인 만료,
-저장소 스냅샷 변경, 중지, 재시작, 중복 메시지, 역할 실행 실패, 토큰·재시도·감사 로그도
-함께 검증한다. `-Online`은 Telegram 연결 상태만 확인하며 메시지를 보내지 않는다.
-
-```powershell
-D:\AI-Agents\scripts\5d-integration-check.ps1
-D:\AI-Agents\scripts\5d-integration-check.ps1 -Online
-```
-
-E-7 첨부파일 안전 처리와 Telegram 형식 첨부 → 임시 Git 저장소 → 빌더·센티널·피니셔 →
-검증 흐름은 아래의 비과금 자동 테스트로 확인한다. 실제 Telegram 봇이나 ChatGPT OAuth 모델을
-호출하지 않으므로, 기존 봇 업데이트를 읽거나 토큰을 쓰지 않는다.
-
-```powershell
-py -3 -m unittest tests.gateway.test_attachments -v
-py -3 -m unittest tests.integration.test_5d_operational_flow.OperationalFlowTests.test_telegram_attachment_to_local_git_pipeline_keeps_document_untrusted -v
-```
-
-실제 외부 종단 확인은 게이트웨이를 실행한 뒤 개인 Telegram 대화에서 작은 텍스트 문서를 보내고,
-승인된 임시 Git 저장소로 한 단계 작업을 요청해 수행한다. 이 확인은 실제 ChatGPT OAuth 모델
-호출과 임시 저장소 커밋을 발생시키므로 사용자가 원할 때만 한다.
-
-### F-7 결정적·Docker·외부 종단 검증
-
-F-7의 기본 묶음은 Telegram 형식 입력부터 SQLite 큐, 임시 Git worktree, 빌더·센티널·피니셔,
-검증, 취소·재시작·token/retention, dirty worktree·HEAD·scope 안전장치, 악성 첨부와 1,000개
-이상 파일 검색, 100회 queue/log 부하를 과금·Docker 없이 재현한다.
-
-```powershell
-D:\AI-Agents\scripts\f7-validation.ps1
-```
-
-`-Docker`는 Docker Desktop과 로컬의 digest-pinned Python/Node image가 준비됐을 때 실제
-컨테이너 경계, repository snapshot 검색, Node/Python fixture를 실행하고, 실행별 소유 컨테이너가
-남지 않는지 확인한다. 스크립트는 image를 내려받거나 외부 컨테이너를 정리하지 않는다. Kotlin DSL/
-Gradle fixture는 같은 명령에서 로컬 Gradle image가 있을 때만 실행한다. image가 없다면 실행하지
-않았다는 경고를 남긴다.
-
-```powershell
-D:\AI-Agents\scripts\f7-validation.ps1 -Docker
-# 같은 코드 상태에서 결정적 묶음을 이미 통과한 경우 Docker 단계만 재실행
-D:\AI-Agents\scripts\f7-validation.ps1 -Docker -DockerOnly
-docker pull gradle@sha256:83798adeb903471219ad918aadda1addb6067e2b9bb3e5332e9f3eb1a382bf43
-D:\AI-Agents\scripts\f7-validation.ps1 -Docker
-```
-
-첫 `docker pull`은 외부 registry 연결과 로컬 image 추가를 발생시키므로 자동으로 실행하지 않는다.
-실제 Telegram/OAuth 종단 확인도 별도 최종 승인이 필요하다. 승인 뒤에는 개인 Telegram 대화에서
-작은 텍스트 문서와 승인된 임시 Git 저장소를 사용해 대표 요청을 한 번 수행하고, 실행 중 `중지`가
-5초 안에 반영되는지, gateway 재시작 뒤 실행이 자동 재실행되지 않고 `NEEDS_ATTENTION`으로 남는지,
-`artifacts\<실행-ID>\events.jsonl`·`data\agent-team.db`·AI-Agents 소유 Docker container 목록을
-확인한다. 실행 결과와 미실행 항목은 `plans\F7-VALIDATION.md`에 기록한다.
-
-## 저장과 복구
-
-- 작업 상태와 대화는 `data\agent-team.db`에 저장한다.
-- 긴 AI 대화는 영속 큐에서 처리하므로 Telegram 수신을 막지 않는다.
-- AI가 답변을 준비하는 동안 Telegram의 `입력 중…` 상태를 주기적으로 표시한다.
-- 자유 대화와 코드 검토는 `요청 분석 → 프로젝트 확인 → AI 분석·협업 → 최종 답변 정리` 진행 카드 한 개를 표시한다. 카드는 단계가 바뀌거나 15초가 지나면 같은 Telegram 메시지에서 갱신되며, 추가 파일 조회 횟수·모델 호출 상한·경과 시간을 함께 보여 준다.
-- 자유 대화·설계·실행 모드와 마지막 대화 상대를 채팅별로 저장한다.
-- 공통·역할별·사용자별·프로젝트별 기억을 분리해 저장한다.
-- 사람이 읽을 수 있는 기록은 `artifacts\<실행-ID>\`에 남긴다.
-- 중복 수신 메시지는 다시 처리하지 않는다.
-- 처리 중 종료된 메시지는 재시작 후 한 번 더 시도한다.
-- 긴 답장은 조각별로 발신함에 저장하므로 중간 전송 실패 시 성공한 앞부분을 다시 보내지 않는다.
-- 발신함은 실행기 임대를 사용해 게이트웨이 두 개가 같은 답장을 동시에 보내지 못하게 한다.
-- 계획은 수정할 때마다 새 버전과 SHA-256 해시로 보관하며, 바뀐 계획은 다시 승인해야 한다.
-- 모델 호출은 공통 토큰 예산·재시도 래퍼를 반드시 거치며 역할별로 사용량을 기록한다.
-- 토큰 원장은 실제 보고값과 추정값을 구분해 SQLite에 보관한다. 한도 경고는 영속 원장으로 중복을 막으므로 게이트웨이를 재시작해도 같은 범위에서 반복 발송하지 않는다.
-- `얘들아`/`셋 다`로 부른 첫 세 역할만 모델 실행을 동시에 하고, 이름을 여러 개 나열한 호출과 에이전트 후속 호출은 문맥 순서대로 처리한다.
-- 토큰·재시도 원장은 병렬 실행 뒤 순서대로 기록한다. 재시도도 메시지당 실제 모델 호출 4회 제한을 소비하며, 재시도 직전에 남은 토큰 예산을 다시 확인한다. 병렬 역할 수·실제 호출 수·전체 소요 시간은 이벤트 로그에 남긴다.
-- 자유 대화는 프로젝트가 아닌 격리된 빈 런타임 폴더에서 도구 없이 실행한다.
-- 자유 상담 호출은 어느 방향이든 가능하다. 실제 작업은 센티널 결과에 따라 빌더 재작업, 피니셔 수정, 피니셔 생략 중 하나로 분기한다.
-- 사용자가 선택한 Git 프로젝트는 3단계 개발 승인이 있기 전까지 변경하지 않는다.
-- 자유 대화의 프로젝트 조회 승인은 기본 720시간 뒤 만료되며 `config\app.json`에서 조정할 수 있다. 경로만 같고 저장소 식별값이 달라진 경우 기존 승인은 재사용하지 않는다.
-- 자유 대화는 승인된 저장소의 커밋된 현재 `HEAD`만 제한적으로 읽는다. 이 내용은 신뢰할 수 없는 입력으로 표시하고 에이전트가 저장소 안의 명령문을 따르지 못하게 한다.
-- 자유 대화의 파일 검색과 줄 범위 상세 읽기는 승인된 동일 `HEAD`에 고정된 전용 도구 계층만 거친다. 중간 조회 응답은 사용자에게 보내지 않고 최종 제안의 근거 문맥으로만 사용한다.
-- 승인 뒤에는 각 단계마다 `빌더 개발 → 센티널 독립 리뷰`를 실행한다. 문제가 없으면 피니셔를 생략하고, 설계 문제는 빌더가 한 번 재작업하며, 구현 문제만 피니셔가 실제 코드로 수정한다.
-- 피니셔가 critical/high 문제를 수정한 경우 검증 재시도까지 끝난 최종 SHA를 센티널이 한 번 마감 재리뷰한다. 문제가 남으면 무한 보완하지 않고 확인 필요 상태로 멈춘다.
-- 개발과 보완 결과는 오케스트레이터가 로컬 커밋한다. 에이전트는 브랜치 변경, commit, push, merge, 배포를 하지 않는다.
-- 개발·리뷰·보완 도구와 Git 조회·stage·commit·검증 명령은 모두 작업마다 짧게 생성되는 Docker 컨테이너에서 실행한다. 승인된 Git 최상위 폴더만 작업공간으로 붙이고, Hermes 프로필의 캐시·스킬·자격증명 폴더는 붙이지 않는다. 이전 Hermes 세션의 작업 경로는 복원하지 않으며, 컨테이너는 네트워크와 호스트 자격 증명을 받지 않는다. 개발·보완 프로필은 컴퓨터 제어·자체 기억·자체 위임 도구를 쓰지 않는다.
-- 각 단계의 `scope`는 설명이 아닌 저장소 기준 상대 파일 경로 또는 끝이 `/`인 폴더 경로여야 한다. 저장소 루트·절대경로·`..`·와일드카드는 계획 단계에서 거절한다.
-- 오케스트레이터는 `git add -A`를 사용하지 않는다. 현재 단계 scope 안에서 바뀐 Git 파일만 컨테이너 안에서 검증 후 파일 단위로 stage·commit하며, scope 밖 변경이 하나라도 있으면 아무 파일도 커밋하지 않고 멈춘다. 따라서 저장소의 hook·filter·fsmonitor 설정은 호스트 프로세스에서 실행되지 않는다.
-- 리뷰는 쓰기 승인을 받지 않으며, 실행 전후 Git 상태가 다르면 즉시 멈춘다.
-- 검증 명령은 셸을 통하지 않고 격리 컨테이너에서 허용 목록의 실행 파일만 사용한다. 직접 코드 실행·패키지 설치/배포·npx 패키지 주입 같은 위험한 형식은 계획 검증에서 거절하고, 검증이 파일을 바꾸면 즉시 멈춘다.
-- 시작 전 작업 트리가 깨끗한지 확인한다. 실행 중 안전 규칙 위반이나 역할/검증 실패 뒤 변경이 남으면 자동으로 되돌리지 않고 `artifacts\<실행-ID>\stages\<단계>\recovery.json`과 추적 파일 diff인 `recovery.patch`를 남긴다. 사용자는 이를 확인한 뒤 직접 보존·복구·폐기를 결정한다.
-- 같은 저장소에는 한 작업만 실행되며, 실행 도중 시스템이 꺼지면 자동 중복 실행하지 않고 확인 필요 상태로 멈춘다.
-- 같은 데이터 폴더의 Telegram 게이트웨이는 한 프로세스만 실행된다. 필수 대화·파이프라인 워커가 비정상 종료되면 게이트웨이도 오류를 기록하고 종료한다.
-- 개발 파이프라인의 단계 알림은 발신함 저장 직후 전용 발신 워커를 깨워 전송하며, Telegram 네트워크 지연이 개발 워커를 막지 않는다. 장시간 모델·검증 실행 중에는 별도 활동 스레드가 입력 상태를 갱신한다.
-- 게이트웨이 종료 시 새 Hermes 호출을 막고 실행 중인 Hermes·검증 명령의 전체 하위 프로세스 트리를 회수한 뒤, 대화·파이프라인·발신 워커가 모두 끝난 것을 확인하고 단일 실행 잠금을 해제한다. Windows는 일시 정지 생성과 Job Object, POSIX는 프로세스 그룹과 `psutil` 후손 추적을 함께 사용한다.
-- 5-D 운영 점검은 실제 Telegram 봇에 메시지를 보내거나 Telegram 업데이트를 소비하지 않는다. 별도 임시 로컬 Git 저장소에서만 커밋을 만들며, 원격 저장소 추가·GitHub push·PR 생성은 하지 않는다.
-- Telegram 첨부파일은 별도 보관소에 원자적으로 저장하고, 다운로드·허용 형식·크기·정적 바이너리 서명·텍스트 인코딩 검사 결과와 SHA-256을 작업 로그에 남긴다. 허용된 문서만 비신뢰 참고자료로 대화 문맥에 넣고, 저장 경로를 벗어나거나 해시가 달라진 사진은 Hermes에 전달하지 않는다.
-
-Docker 격리는 필수다. Docker Desktop이 꺼져 있으면 `check`와 실제 Hermes 실행은 시작 전에 중단한다.
-인터넷이 필요한 의존성 설치나 외부 서비스 접근은 기본 구성에서 허용하지 않는다. 필요한 저장소가
-생기면 해당 작업의 네트워크 정책을 별도로 승인·기록하는 기능을 추가한 뒤에만 열어야 한다.
-
-이전 `/task`, `/project` 방식 실행기는 [coordinator 설명](coordinator/README.md)에 분리했고, 실수로 실행되지 않도록 `-AllowLegacy`를 요구한다.
+개인 개발용 에이전트 지침·스킬·세션 계획·리뷰 기록과 실행 데이터는 로컬에 보관합니다. 공개 저장소에는 프로그램 소스, 실행에 필요한 역할 지침, 설정 예시와 테스트를 포함합니다.

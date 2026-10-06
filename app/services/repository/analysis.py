@@ -5,6 +5,11 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
+from app.services.message_intent import (
+    is_full_repository_audit_request,
+    is_long_repository_analysis_request,
+)
+
 
 class RepositoryAnalysisStatus(str, Enum):
     QUEUED = "QUEUED"
@@ -53,41 +58,6 @@ class RepositoryAnalysisStopReason(str, Enum):
     REPOSITORY_IDENTITY_CHANGED = "REPOSITORY_IDENTITY_CHANGED"
     MODEL_OUTCOME_UNKNOWN = "MODEL_OUTCOME_UNKNOWN"
     SUPERSEDED = "SUPERSEDED"
-
-
-_LONG_ANALYSIS_PATTERNS = (
-    r"전체\s*(?:코드|소스|저장소|레포|프로젝트|모듈|구조|테스트)",
-    r"(?:프로젝트|저장소|레포)\s*전반",
-    r"모든\s*(?:코드|소스|파일|모듈|테스트)",
-    r"전체\s*테스트\s*전략",
-    r"(?:아키텍처|구조)\s*전체",
-    r"(?:complete|full)\s+(?:repository|repo|codebase|audit|analysis)",
-    r"(?:repository|repo|codebase)[\s-]*(?:wide|audit)",
-)
-_LONG_ANALYSIS_REQUEST = re.compile("|".join(_LONG_ANALYSIS_PATTERNS), re.IGNORECASE)
-
-
-def is_long_repository_analysis_request(text: str) -> bool:
-    """Return true only for broad repository requests, not ordinary code questions."""
-    normalized = re.sub(r"\s+", " ", text.strip()).casefold()
-    if not normalized or not _LONG_ANALYSIS_REQUEST.search(normalized):
-        return False
-    # Mentioning an analysis in a question is not a request to run one.
-    if re.search(r"(?:왜|무엇|뭐|어떻게|언제|어떤).*?(?:말해|설명|알려|궁금)|(?:이란|란|라는|인지|하는지|되는지)\b", normalized):
-        return False
-    if re.search(r"(?:수정|고쳐|개발|구현|추가|작성|만들|삭제|바꿔|적용)\s*(?:해|해줘|해주세요|하자|하고\s*싶)", normalized):
-        return False
-    if re.search(r"(?:하지\s*마|말아|하지\s*않|안\s*해)", normalized):
-        return False
-    return bool(re.search(r"(?:분석|검토|확인|읽어|살펴|조사|파악|점검|전략|감사)(?:해|해줘|해주세요|하자|해\s*줘|해\s*주세요|해봐|해\s*봐)?", normalized))
-
-
-def is_full_repository_audit_request(text: str) -> bool:
-    """A whole-code request promises every eligible source, not an adaptive sample."""
-    return is_long_repository_analysis_request(text) and bool(re.search(
-        r"(?:전체\s*(?:코드|소스|파일)|모든\s*(?:코드|소스|파일)|full\s+(?:codebase|repository|repo|audit))",
-        text, re.IGNORECASE,
-    ))
 
 
 @dataclass(frozen=True)

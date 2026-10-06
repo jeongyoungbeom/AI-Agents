@@ -63,6 +63,7 @@ class RepositorySnapshotManifest:
     branch: str
     entries: tuple[RepositorySnapshotEntry, ...]
     exclusions: tuple[tuple[str, int], ...] = ()
+    working_tree_dirty: bool = False
 
 
 @dataclass(frozen=True)
@@ -441,6 +442,12 @@ class SafeRepositoryReader:
             branch=identity.branch,
             entries=tuple(sorted(entries, key=lambda item: item.path.casefold())),
             exclusions=tuple(sorted(exclusions.items())),
+            working_tree_dirty=bool(_git_bytes(
+                root, "status", "--porcelain", "--untracked-files=normal",
+                maximum=self.max_tree_bytes, sandbox=self.sandbox,
+                operation_id=operation_id, component="repository-analysis-manifest",
+                cancelled=cancelled,
+            )),
         )
 
     def read_pinned_files(
@@ -538,6 +545,68 @@ class SafeRepositoryReader:
             except (KeyError, ValueError, UnicodeDecodeError) as exc:
                 raise RepositoryAccessError("고정 스냅샷 파일 결과가 손상되었습니다.") from exc
         return tuple(documents), tuple(excluded)
+
+    def read_pinned_ranges(
+        self, repository_path: str | Path, manifest: RepositorySnapshotManifest,
+        paths: tuple[str, ...], *, start_lines: dict[str, int],
+        max_chunk_bytes: int, max_scan_bytes: int,
+        operation_id: str | None = None, cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[tuple[dict, ...], tuple[tuple[str, str], ...]]:
+        """원본 blob을 제한된 격리 프로세스에서 검증하고 연속 행 조각만 반환한다."""
+        if max_chunk_bytes < 1 or max_scan_bytes < 1 or not paths or len(set(paths)) != len(paths):
+            raise ValueError("pinned range limits and paths must be valid")
+        root = Path(repository_path).resolve(strict=True)
+        entries = {item.path: item for item in manifest.entries}
+        selected = [entries.get(path) for path in paths]
+        if any(item is None or item.size < 0 or not self._path_is_safe(item.path) for item in selected):
+            raise RepositoryAccessError("승인된 고정 파일 경로가 아닙니다.")
+        total = sum(item.size for item in selected)
+        if total > max_scan_bytes:
+            raise RepositoryAccessError("고정 blob 스캔 크기 제한을 초과했습니다.")
+        if any(type(start_lines.get(path, 1)) is not int or start_lines.get(path, 1) < 1 for path in paths):
+            raise RepositoryAccessError("고정 파일 시작 행이 올바르지 않습니다.")
+        result = _repository_protocol(
+            root, {"mode": "pinned_read", "identity_root": str(root),
+                   "expected_identity": manifest.identity_hash, "commit_sha": manifest.commit_sha,
+                   "entries": [{"path": item.path, "size": item.size, "object_id": item.object_id,
+                                "start_line": start_lines.get(item.path, 1)} for item in selected],
+                   "chunk_bytes": max_chunk_bytes, "max_git_bytes": total + len(selected) * 160 + 1024,
+                   "policy": {"sensitive_parts": sorted(_SENSITIVE_PARTS),
+                              "sensitive_suffixes": sorted(_SENSITIVE_SUFFIXES)}},
+            maximum=max_chunk_bytes * len(paths) * 2 + len(paths) * 512 + 4096,
+            sandbox=self.sandbox, operation_id=operation_id,
+            component="repository-analysis-read", cancelled=cancelled,
+        )
+        if result.get("identity_hash") != manifest.identity_hash:
+            raise RepositoryIdentityChanged("고정 저장소 식별값이 달라졌습니다.")
+        if result.get("commit_sha") != manifest.commit_sha:
+            raise RepositoryPinnedSnapshotUnavailable("고정 commit을 읽을 수 없습니다.")
+        rows = result.get("results")
+        if not isinstance(rows, list) or len(rows) != len(paths):
+            raise RepositoryAccessError("고정 행 조회 결과가 올바르지 않습니다.")
+        documents, exclusions = [], []
+        for item, row in zip(selected, rows):
+            if not isinstance(row, dict) or row.get("path") != item.path:
+                raise RepositoryAccessError("고정 행 조회 경로가 달라졌습니다.")
+            if row.get("status") == "excluded" and row.get("reason") in {"binary_content", "non_utf8", "line_size_limit"}:
+                exclusions.append((item.path, row["reason"]))
+                continue
+            try:
+                data = base64.b64decode(row["data"], validate=True)
+                if any(type(row[key]) is not int for key in ("start_line", "end_line", "total_lines", "next_line")):
+                    raise ValueError("range type mismatch")
+                start, end, total_lines, next_line = (int(row[key]) for key in ("start_line", "end_line", "total_lines", "next_line"))
+                if (row.get("status") != "ok" or len(data) > max_chunk_bytes
+                        or start != start_lines.get(item.path, 1) or not 1 <= start <= end <= total_lines
+                        or next_line != (end + 1 if end < total_lines else 0)
+                        or max(1, len(data.splitlines())) != end - start + 1):
+                    raise ValueError("range mismatch")
+                documents.append({"path": item.path, "content": self.redactor.text(data.decode("utf-8"), preserve_lines=True),
+                                  "start_line": start, "end_line": end, "total_lines": total_lines,
+                                  "next_line": next_line})
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+                raise RepositoryAccessError("고정 행 조회 결과가 손상됐습니다.") from exc
+        return tuple(documents), tuple(exclusions)
 
     def _read_blob(
         self,

@@ -54,7 +54,12 @@ class SecretRedactor:
         "refresh_token",
     }
 
-    def text(self, value: str) -> str:
+    def text(self, value: str, *, preserve_lines: bool = False) -> str:
+        def mask(value: str) -> str:
+            if preserve_lines and value:
+                return re.sub(r"[^\r\n]+", REDACTED, value)
+            return REDACTED
+
         result = value
         for index, pattern in enumerate(self._credential_patterns):
             if index == 0:
@@ -62,10 +67,10 @@ class SecretRedactor:
                     lambda match: f"{match.group(1)}{REDACTED}@", result
                 )
             else:
-                result = pattern.sub(REDACTED, result)
+                result = pattern.sub(lambda match: mask(match.group()), result)
         result = self._quoted_key_value.sub(
             lambda match: (
-                f"{match.group(1)}{match.group(2)}{REDACTED}{match.group(4)}"
+                f"{match.group(1)}{match.group(2)}{mask(match.group(3))}{match.group(4)}"
             ),
             result,
         )

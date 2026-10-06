@@ -42,6 +42,11 @@ class QueueTests(unittest.TestCase):
 class FakeProcess:
     returncode = 0
 
+    def __init__(self, command):
+        path = Path(command[command.index("--result-file") + 1])
+        path.write_text(json.dumps({"status": "succeeded", "text": '{"summary":"ok","needs_user_input":[]}',
+                                    "error": "", "failure_reason": "", "session_id": "fixture"}), encoding="utf-8")
+
     def communicate(self, timeout=None):
         return '{"summary":"ok","needs_user_input":[]}', ""
 
@@ -104,7 +109,7 @@ class HermesPermissionTests(unittest.TestCase):
 
             def fake_popen(command, **kwargs):
                 commands.append(command)
-                return FakeProcess()
+                return FakeProcess(command)
 
             with patch("app.services.hermes.runner.subprocess.Popen", side_effect=fake_popen):
                 runner.run(
@@ -169,7 +174,7 @@ class HermesPermissionTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return FakeProcess()
+                return FakeProcess(command)
 
             with patch("app.services.hermes.runner.subprocess.Popen", side_effect=fake_popen):
                 result = runner.run(
@@ -217,7 +222,7 @@ class HermesPermissionTests(unittest.TestCase):
 
             def fake_popen(command, **kwargs):
                 commands.append(command)
-                return FakeProcess()
+                return FakeProcess(command)
 
             with patch("app.services.hermes.runner.subprocess.Popen", side_effect=fake_popen):
                 runner.run(

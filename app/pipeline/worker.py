@@ -11,12 +11,14 @@ from app.services.git import GitRepositoryError
 from app.services.logging.audit import AuditLogger
 from app.services.logging.redaction import SecretRedactor
 from app.storage import StateStore
+from app.storage.sqlite_store import StoreError
 from app.services.verification import UnsafeVerificationCommand
 
 from .coordinator import (
     PipelineCancelled,
     PipelineCoordinator,
     PipelineNeedsAttention,
+    PipelineSteeringPending,
     PipelineUserInputRequired,
 )
 
@@ -110,18 +112,46 @@ class PipelineWorker:
         run_id = str(job["run_id"])
         channel = str(job["channel"])
         conversation_id = str(job["conversation_id"])
+        lease_lost = threading.Event()
+
+        def owned() -> bool:
+            try:
+                self.store.assert_pipeline_owner(run_id, self.instance_id)
+            except StoreError:
+                lease_lost.set()
+                return False
+            return True
 
         def cancelled() -> bool:
             return (
                 self._stop.is_set()
+                or lease_lost.is_set()
                 or self.store.pipeline_cancel_requested(run_id)
                 or self.store.pipeline_pause_requested(run_id)
+                or (self.store.load_conversation(channel, conversation_id) or {}).get('active_task_id') != run_id
             )
 
         def heartbeat() -> None:
             self.store.heartbeat_pipeline_job(
                 run_id, self.instance_id, lease_seconds=self.lease_seconds
             )
+
+        def keep_lease() -> None:
+            while not activity_stop.wait(min(4.0, self.lease_seconds / 3)):
+                try:
+                    heartbeat()
+                except StoreError:
+                    lease_lost.set()
+                    return
+                # The repository lock may not exist during approval checks yet.
+                if self.store.repository_lock_owned(self.store.load_run(run_id).repository, run_id, self.instance_id):
+                    try:
+                        self.store.renew_repository_lock(
+                            self.store.load_run(run_id).repository, run_id, self.instance_id,
+                        )
+                    except StoreError:
+                        lease_lost.set()
+                        return
 
         activity_stop = threading.Event()
         activity_thread = threading.Thread(
@@ -131,6 +161,8 @@ class PipelineWorker:
             daemon=True,
         )
         activity_thread.start()
+        lease_thread = threading.Thread(target=keep_lease, name=f'pipeline-lease-{run_id}', daemon=True)
+        lease_thread.start()
 
         try:
             self.coordinator.execute(
@@ -141,14 +173,25 @@ class PipelineWorker:
                 cancelled=cancelled,
                 heartbeat=heartbeat,
             )
+        except PipelineSteeringPending:
+            if not owned():
+                return True
+            with self.store.transaction():
+                self._pause_state(run_id, '중간 메시지의 해석/추가 범위 확인을 기다립니다. 현재 변경을 보존했습니다.')
+                self.store.finish_pipeline_job(run_id, self.instance_id, 'NEEDS_ATTENTION', 'STEERING_PENDING')
+                if not any(item['status'] in {'RECEIVED', 'WAITING_APPROVAL'} for item in self.store.execution_inputs(run_id)):
+                    self.machine.transition(self.store.load_run(run_id), RunPhase.DEVELOPING, message='확정된 중간 지시로 계속합니다.')
+                    self.store.requeue_pipeline_job(run_id)
         except PipelineCancelled as exc:
+            if not owned():
+                return True
             if self.store.pipeline_pause_requested(run_id):
                 message = "사용자가 중지를 요청했습니다."
                 self._pause_state(run_id, message)
                 self.store.finish_pipeline_job(
                     run_id, self.instance_id, "NEEDS_ATTENTION", message
                 )
-                self._queue_outbound(
+                self._queue_run_outbound(run_id,
                     channel,
                     conversation_id,
                     "작업을 안전한 지점에서 일시 중지했습니다. 계속하려면 '재개'라고 말해 주세요.",
@@ -158,9 +201,11 @@ class PipelineWorker:
             self.store.finish_pipeline_job(
                 run_id, self.instance_id, "CANCELLED", self.redactor.text(str(exc))
             )
-            self._queue_outbound(channel, conversation_id, "작업을 안전하게 중지했습니다.")
-            self.store.set_conversation_mode(channel, conversation_id, "free_chat")
+            self._queue_run_outbound(run_id, channel, conversation_id, "작업을 안전하게 중지했습니다.")
+            self._set_mode_for_run(run_id, channel, conversation_id, "free_chat")
         except PipelineUserInputRequired as exc:
+            if not owned():
+                return True
             questions = tuple(self.redactor.text(item) for item in exc.questions)
             self.store.open_execution_question(
                 run_id, exc.stage_id, exc.role_id.value, questions
@@ -170,13 +215,13 @@ class PipelineWorker:
             self.store.finish_pipeline_job(
                 run_id, self.instance_id, "NEEDS_ATTENTION", message
             )
-            self._queue_outbound(
+            self._queue_run_outbound(run_id,
                 channel,
                 conversation_id,
                 "작업을 멈추고 확인을 기다립니다.\n"
                 f"[{exc.role_id.value}] "
                 + "\n".join(f"- {question}" for question in questions)
-                + "\n\n답변을 보내면 안전한 단계 시작 지점부터 다시 진행합니다.",
+                + "\n\n답변을 보내면 보존된 작업 공간과 candidate에서 이어서 진행합니다.",
             )
         except (
             PipelineNeedsAttention,
@@ -184,27 +229,33 @@ class PipelineWorker:
             BudgetExceeded,
             UnsafeVerificationCommand,
         ) as exc:
+            if not owned():
+                return True
             message = self.redactor.text(str(exc))
             self._pause_state(run_id, message)
             self.store.finish_pipeline_job(
                 run_id, self.instance_id, "NEEDS_ATTENTION", message
             )
-            self._queue_outbound(
+            self._queue_run_outbound(run_id,
                 channel, conversation_id, f"작업을 멈췄습니다. 확인이 필요합니다: {message}"
             )
         except Exception as exc:
+            if not owned():
+                return True
             message = self.redactor.text(f"{type(exc).__name__}: {exc}")
             self._fail_state(run_id, message)
             self.store.finish_pipeline_job(run_id, self.instance_id, "FAILED", message)
-            self._queue_outbound(
+            self._queue_run_outbound(run_id,
                 channel, conversation_id, f"작업 중 오류가 발생해 중단했습니다: {message[:1000]}"
             )
-            self.store.set_conversation_mode(channel, conversation_id, "free_chat")
+            self._set_mode_for_run(run_id, channel, conversation_id, "free_chat")
         else:
-            self.store.finish_pipeline_job(run_id, self.instance_id, "COMPLETED")
+            if owned():
+                self.store.finish_pipeline_job(run_id, self.instance_id, "COMPLETED")
         finally:
             activity_stop.set()
             activity_thread.join(timeout=2)
+            lease_thread.join(timeout=2)
         return True
 
     def run_forever(self) -> None:
@@ -216,15 +267,31 @@ class PipelineWorker:
     def _recover_stale(self) -> None:
         for job in self.store.recover_stale_pipeline_jobs():
             run_id = str(job["run_id"])
-            message = "이전 실행이 저장소 변경 도중 종료되어 자동 재실행하지 않습니다."
+            if self.store.load_run(run_id).phase == RunPhase.COMPLETED:
+                self.store.requeue_pipeline_job(run_id)
+                continue
+            checkpoint = self.store.pipeline_workspace(run_id)
+            message = "이전 실행이 종료되었습니다. 작업 공간과 candidate를 보존했으며 확인 후 재개할 수 있습니다."
+            if checkpoint:
+                message += f"\n작업 공간: {checkpoint['worktree']['worktree_path']}\ncandidate: {checkpoint['candidate_sha']}"
             self._pause_state(run_id, message)
-            self._queue_outbound(
+            self._queue_run_outbound(run_id,
                 str(job["channel"]), str(job["conversation_id"]), message
             )
 
     def _queue_outbound(self, channel: str, conversation_id: str, text: str) -> None:
         self.store.queue_outbound(channel, conversation_id, text)
         self._notify_outbound()
+
+    def _queue_run_outbound(self, run_id, channel, conversation_id, text):
+        with self.store.transaction():
+            if (self.store.load_conversation(channel, conversation_id) or {}).get('active_task_id') == run_id:
+                self._queue_outbound(channel, conversation_id, text)
+
+    def _set_mode_for_run(self, run_id, channel, conversation_id, mode):
+        with self.store.transaction():
+            if (self.store.load_conversation(channel, conversation_id) or {}).get('active_task_id') == run_id:
+                self.store.set_conversation_mode(channel, conversation_id, mode)
 
     def _notify_outbound(self) -> None:
         try:

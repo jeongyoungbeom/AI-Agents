@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -7,7 +8,9 @@ from typing import Callable
 
 from app.services.git import GitRepository
 from app.services.process_tree import ProcessTree, isolated_process_options
-from app.services.sandbox import DockerSandbox, DockerSandboxError
+from app.services.sandbox import (
+    DockerSandbox, DockerSandboxCancelled, DockerSandboxError, DockerSandboxTimeout,
+)
 
 from .policy import SafeVerificationPolicy
 
@@ -20,6 +23,7 @@ class VerificationFailureKind:
     PASSED = "passed"
     TOOL_UNAVAILABLE = "tool_unavailable"
     DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
     TIMEOUT = "timeout"
     TEST_FAILURE = "test_failure"
 
@@ -27,15 +31,16 @@ class VerificationFailureKind:
 @dataclass(frozen=True)
 class VerificationResult:
     command: str
-    return_code: int
+    return_code: int | None
     stdout: str
     stderr: str
     elapsed_seconds: float
     failure_kind: str = VerificationFailureKind.PASSED
+    started: bool = True
 
     @property
     def passed(self) -> bool:
-        return self.return_code == 0
+        return self.started and self.return_code == 0
 
     def to_dict(self) -> dict:
         value = asdict(self)
@@ -79,6 +84,8 @@ class VerificationRunner:
         )
         cache_mounts = tuple(getattr(environment, "cache_mounts", ()))
         for command in commands:
+            if cancelled is not None and cancelled():
+                raise VerificationCancelled("사용자가 검증을 중지했습니다.")
             prepared = self.policy.prepare(command)
             started = time.monotonic()
             try:
@@ -102,7 +109,20 @@ class VerificationRunner:
                     writable_git_metadata=False,
                 )
             except DockerSandboxError as exc:
-                raise RuntimeError(f"검증 도구를 시작하지 못했습니다: {prepared.display}") from exc
+                if isinstance(exc, DockerSandboxCancelled):
+                    raise VerificationCancelled("사용자가 검증을 중지했습니다.") from exc
+                results.append(
+                    VerificationResult(
+                        prepared.display, None, "",
+                        f"검증 환경을 시작하지 못했습니다: {exc}",
+                        time.monotonic() - started,
+                        VerificationFailureKind.TIMEOUT if isinstance(exc, DockerSandboxTimeout)
+                        else VerificationFailureKind.ENVIRONMENT_UNAVAILABLE,
+                        started=False,
+                    )
+                )
+                repository.assert_position(baseline, allow_worktree_changes=False)
+                return tuple(results)
             try:
                 process_tree = ProcessTree(process)
             except BaseException:
@@ -171,9 +191,36 @@ class VerificationRunner:
     def _failure_kind(stdout: str, stderr: str, return_code: int) -> str:
         if return_code == 0:
             return VerificationFailureKind.PASSED
-        detail = (stdout + "\n" + stderr).casefold()
-        if any(value in detail for value in ("command not found", "executable file not found", "not recognized as an internal")):
+        # An uncaught terminal exception takes precedence over earlier handled
+        # warnings and diagnostic words embedded in assertion messages.
+        diagnostics = stderr.strip() or stdout.strip()
+        exceptions = re.findall(
+            r"^\s*(?:E\s+)?((?:[A-Za-z_][\w.]*)?(?:Error|Exception)):\s*(.*)$",
+            diagnostics, re.MULTILINE,
+        )
+        if exceptions:
+            name, message = exceptions[-1]
+            exception_type = name.rsplit('.', 1)[-1]
+            if exception_type == "ModuleNotFoundError" or (
+                exception_type == "ImportError" and re.match(r"No module named\b", message)
+            ):
+                return VerificationFailureKind.DEPENDENCY_UNAVAILABLE
+            if name == "Error" and re.match(r"Cannot find (?:module|package)\b", message):
+                return VerificationFailureKind.DEPENDENCY_UNAVAILABLE
+            return VerificationFailureKind.TEST_FAILURE
+        if return_code == 127:
             return VerificationFailureKind.TOOL_UNAVAILABLE
-        if any(value in detail for value in ("offline mode", "no cached version", "could not resolve", "cannot find module", "no module named", "module not found", "dependency")):
+        # Recognize tool/build diagnostics, not arbitrary log substrings.
+        if re.search(
+            r"(?im)^\s*(?:exec:|(?:/bin/)?(?:ba)?sh:)\s*.*"
+            r"(?:command not found|executable file not found|not recognized as an internal|: not found)(?:\s|$)",
+            stderr,
+        ):
+            return VerificationFailureKind.TOOL_UNAVAILABLE
+        if re.search(
+            r"(?im)^\s*(?:>\s*|\[ERROR\]\s*)"
+            r"(?:Could not resolve\b|No cached version\b|.*\boffline mode\b)",
+            diagnostics,
+        ):
             return VerificationFailureKind.DEPENDENCY_UNAVAILABLE
         return VerificationFailureKind.TEST_FAILURE

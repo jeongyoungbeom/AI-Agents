@@ -70,12 +70,18 @@ class GatewayApplication:
         )
         if not claimed:
             return ()
+        # 이 값은 수신자가 제출한 metadata가 아니라 게이트웨이의 정본 binding이다.
+        message = replace(message, metadata={key: value for key, value in message.metadata.items()
+                                           if not key.startswith('gateway_')})
         try:
+            immediate_check = getattr(self.router, 'is_immediate_control', lambda _message: False)
+            immediate = bool(immediate_check(message))
             if (
                 self.conversation_scheduler is not None
-                and not self.router.is_immediate_control(message)
+                and not immediate
             ):
                 with self.store.transaction():
+                    message = self._bind_received_message(message)
                     job = self.conversation_scheduler.enqueue(message)
                     self.store.complete_inbound_with_outbound(
                         message.channel, receipt_id, []
@@ -86,6 +92,9 @@ class GatewayApplication:
                     f"conversation={message.conversation_id}"
                 )
                 return ()
+            if not immediate:
+                with self.store.transaction():
+                    message = self._bind_received_message(message)
             is_new_control = getattr(
                 self.router, "is_new_control", lambda _message: False
             )
@@ -99,10 +108,6 @@ class GatewayApplication:
                 self.conversation_scheduler.cancel(
                     message.channel, message.conversation_id
                 )
-            immediate_check = getattr(
-                self.router, "is_immediate_control", lambda _message: False
-            )
-            immediate = bool(immediate_check(message))
             if immediate:
                 # 상태/중지/새 작업은 모델을 호출하지 않으므로 응답까지 한 번에 확정한다.
                 with self.store.transaction():
@@ -160,6 +165,19 @@ class GatewayApplication:
             metadata["gateway_outbox_id"] = outbound_id
             queued.append(replace(item, metadata=metadata))
         return tuple(queued)
+
+    def _bind_received_message(self, message):
+        binding = self.store.load_conversation(message.channel, message.conversation_id)
+        entry = self.store.capture_execution_input(
+            message.channel, message.conversation_id, message.user_id,
+            message.external_message_id, self.redactor.text(message.text),
+        )
+        metadata = dict(message.metadata)
+        if binding and binding.get('active_task_id'):
+            metadata['gateway_run_id'] = binding['run_id']
+        if entry:
+            metadata['gateway_execution_input'] = entry['input_id']
+        return replace(message, metadata=metadata)
 
     @staticmethod
     def _receipt_id(message: IncomingMessage) -> str:

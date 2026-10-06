@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import threading
@@ -10,10 +11,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.contracts import RoleId, RunPhase, RunState, StageContract
+from app.contracts.outcomes import RequestOutcome, RequestResult
 from app.orchestrator import RunStateMachine
 from app.services.budget import BudgetExceeded, BudgetManager
 from app.services.context import ContextService
 from app.services.hermes import HermesCancelled
+from app.services.git import GitRepository
 from app.services.logging.audit import AuditLogger
 from app.services.logging.redaction import SecretRedactor
 from app.services.repository import (
@@ -38,6 +41,7 @@ from .models import (
     AgentCallRequest,
     AgentReply,
     ConversationMode,
+    ConversationResult,
     IncomingMessage,
     MemoryScope,
     OutgoingMessage,
@@ -52,6 +56,8 @@ from .ports import (
     RepositoryValidator,
     TeamConversationBackend,
 )
+from app.services.message_intent import TaskIntent, forbids_repository_reads, is_work_request
+
 from .role_routing import RoleResolver
 
 
@@ -66,13 +72,6 @@ _REPOSITORY_CALL_BLOCKLIST = re.compile(
     r"run\s+(this|a)?\s*(command|script|review)|shell|powershell|cmd(?:\.exe)?|"
     r"curl|wget|api[_ -]?key|token|secret|password|credential|"
     r"명령|지시|프롬프트|시스템|무시|비밀번호|비밀|토큰|자격.?증명|환경.?변수",
-    re.IGNORECASE,
-)
-_REPOSITORY_USER_COLLABORATION_REQUEST = re.compile(
-    r"다른\s*(?:에이전트|역할|애(?:들)?|팀원).{0,40}"
-    r"(?:불러|물어|호출|검토|의견|확인)|"
-    r"(?:불러|물어|호출|검토|의견|확인).{0,40}"
-    r"다른\s*(?:에이전트|역할|애(?:들)?|팀원)",
     re.IGNORECASE,
 )
 _PLAN_REVISION_REQUEST = re.compile(
@@ -95,7 +94,7 @@ _REPOSITORY_CALL_PURPOSES = {
 }
 HELP_TEXT = """대화형 개발 에이전트 게이트웨이
 
-빌더·센티널·피니셔와 평소처럼 대화하면 됩니다. 이름을 부르지 않으면 마지막 대화 상대가 답합니다. '얘들아' 또는 '셋 다'라고 부르면 세 역할을 모두 선택합니다.
+빌더·센티널·피니셔와 평소처럼 대화하면 됩니다. 이름을 부르지 않으면 현재 담당이 답합니다. '얘들아' 또는 '셋 다'라고 부르면 세 역할을 모두 선택합니다. 상담이나 단체 응답은 담당을 바꾸지 않습니다. '앞으로 빌더가 맡아'로 담당을 명시적으로 넘길 수 있습니다.
 
 프로젝트 코드를 함께 보려면 자유 대화 중에도 Git 프로젝트의 절대경로를 보낼 수 있습니다. 승인 뒤에는 에이전트가 필요한 커밋 파일을 제한적으로 검색하고 상세 줄을 확인할 수 있습니다.
 경로와 질문을 한 메시지에 함께 보내도 됩니다. 예: `센티널아\nC:\\projects\\sample\n이 프로젝트를 정리해줘`.
@@ -116,6 +115,7 @@ class _QueuedConversationTask:
     purpose: str
     repository_context: dict
     repository_tool_round: int = 0
+    consultation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,7 +177,8 @@ class DialogueRouter:
         repository_tools: SafeRepositoryToolLayer | None = None,
         repository_approval_ttl_hours: int = 720,
         pending_project_request_ttl_hours: int = 24,
-        max_repository_tool_rounds: int = 2,
+        max_repository_tool_rounds: int = 8,
+        max_agent_loop_seconds: float = 300,
         budget: BudgetManager | None = None,
         execution_preflight: ToolchainService | None = None,
         repository_analysis_scheduler: RepositoryAnalysisScheduler | None = None,
@@ -207,9 +208,12 @@ class DialogueRouter:
                 "pending project request TTL must be between 1 and 168 hours"
             )
         self.pending_project_request_ttl_hours = pending_project_request_ttl_hours
-        if not 1 <= max_repository_tool_rounds <= 3:
-            raise ValueError("repository tool rounds must be between 1 and 3")
+        if not 1 <= max_repository_tool_rounds <= 64:
+            raise ValueError("repository tool rounds must be between 1 and 64")
         self.max_repository_tool_rounds = max_repository_tool_rounds
+        if max_agent_loop_seconds <= 0:
+            raise ValueError("agent loop duration must be positive")
+        self.max_agent_loop_seconds = max_agent_loop_seconds
         self.pipeline_scheduler = pipeline_scheduler
         self.conversation_scheduler = conversation_scheduler
         if not 1 <= max_auto_agent_replies <= 4:
@@ -290,7 +294,7 @@ class DialogueRouter:
             state = self._active_progress.get(
                 (message.channel, message.conversation_id)
             )
-        if state is None:
+        if state is None or state.progress.reply_to != message.external_message_id:
             return
         self._update_conversation_progress(
             message,
@@ -298,7 +302,8 @@ class DialogueRouter:
             completed_steps=state.completed_steps,
             active_step=state.active_step,
             detail=detail,
-            outcome="attention",
+            outcome="failed",
+            force_terminal=True,
         )
 
     def cancel_conversation_progress(self, message: IncomingMessage) -> None:
@@ -307,28 +312,57 @@ class DialogueRouter:
             state = self._active_progress.get(
                 (message.channel, message.conversation_id)
             )
-        if state is None:
+        if state is None or state.progress.reply_to != message.external_message_id:
             return
         self._update_conversation_progress(
             message,
             state.progress,
             completed_steps=state.completed_steps,
             active_step=state.active_step,
-            detail="사용자 요청으로 대화 처리를 중지했습니다.",
+            detail=state.detail if state.outcome == "cancelled" else "사용자 요청으로 대화 처리를 중지했습니다.",
             outcome="cancelled",
+            force_terminal=True,
         )
 
     def complete_conversation_progress(self, message: IncomingMessage) -> None:
         """Forget a terminal card after its owning queue job is committed."""
         with self._progress_lock:
-            self._active_progress.pop((message.channel, message.conversation_id), None)
+            key = (message.channel, message.conversation_id)
+            state = self._active_progress.get(key)
+            if state and state.progress.reply_to == message.external_message_id:
+                self._active_progress.pop(key, None)
 
     def route(
+        self, message: IncomingMessage, *, cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[OutgoingMessage, ...]:
+        routed = self.route_result(message, cancelled=cancelled)
+        return tuple(replace(item, metadata={
+            **item.metadata, "request_result": routed.result.to_dict(),
+        }) for item in routed.messages)
+
+    def route_result(
+        self, message: IncomingMessage, *, cancelled: Callable[[], bool] | None = None,
+    ) -> ConversationResult:
+        routed = self._route(message, cancelled=cancelled)
+        if not isinstance(routed, ConversationResult):
+            explicit = next((item.metadata["request_result"] for item in routed
+                             if "request_result" in item.metadata), None)
+            result = RequestResult.from_dict(explicit) if explicit else RequestResult(
+                RequestOutcome.SUCCESS, "CONTROL_RESPONSE" if self.is_immediate_control(message) else "",
+            )
+            routed = ConversationResult(routed, result)
+        self.store.save_conversation_result(
+            message.channel, message.conversation_id, message.external_message_id,
+            routed.result,
+        )
+        return routed
+
+    def _route(
         self,
         message: IncomingMessage,
         *,
         cancelled: Callable[[], bool] | None = None,
-    ) -> tuple[OutgoingMessage, ...]:
+    ) -> tuple[OutgoingMessage, ...] | ConversationResult:
         self._check_cancelled(cancelled)
         text = message.text.strip()
         control = text.lower()
@@ -354,9 +388,19 @@ class DialogueRouter:
                     conversation_id=message.conversation_id,
                     text="이 대화의 작업 소유자만 요청할 수 있습니다.",
                     reply_to=message.external_message_id,
+                    metadata={"request_result": RequestResult(
+                        RequestOutcome.FAILED, "ACCESS_DENIED",
+                    ).to_dict()},
                 ),
             )
         bound_state = self.store.load_run(binding["run_id"]) if binding else None
+        captured_run = message.metadata.get('gateway_run_id')
+        if captured_run and (binding is None or binding['run_id'] != captured_run):
+            return ConversationResult((), RequestResult(RequestOutcome.CANCELLED, 'SUPERSEDED_TASK'))
+
+        input_id = message.metadata.get('gateway_execution_input')
+        if input_id and binding and bound_state:
+            return self._execution_message(message, binding, bound_state, input_id, cancelled=cancelled)
 
         if control in self.help_controls():
             if bound_state is not None and binding is not None:
@@ -366,6 +410,10 @@ class DialogueRouter:
             if bound_state is not None and binding is not None:
                 self._record_inbound(bound_state, message, binding["active_role"])
             return (self._status(message, binding),)
+        if self.is_budget_control(message):
+            if bound_state is not None and binding is not None:
+                self._record_inbound(bound_state, message, binding["active_role"])
+            return (self._budget_control(message, binding),)
         if control in {"분석 결과", "분석 결과 조회"}:
             if bound_state is not None and binding is not None:
                 self._record_inbound(bound_state, message, binding["active_role"])
@@ -426,11 +474,18 @@ class DialogueRouter:
                 ),
             )
 
-        selection = self.role_resolver.resolve(text, binding["active_role"])
-        if selection.explicit and not selection.group_call:
+        selection = self.role_resolver.interpret(text, binding["active_role"])
+        message = replace(message, metadata={**message.metadata, "user_intent": selection.to_dict()})
+        if selection.explicit and not selection.group_call and len(selection.roles) == 1:
+            previous_role = binding["active_role"]
             self.store.set_conversation_role(
-                message.channel, message.conversation_id, selection.roles[-1].value
+                message.channel, message.conversation_id, selection.roles[0].value
             )
+            if self.role_resolver.handoff_target(text) is not None:
+                self.logger.emit(state.run_id, "CONVERSATION_OWNER_HANDED_OFF",
+                    "사용자 원문의 명시적 인계로 담당을 변경했습니다.",
+                    data={"from_role": previous_role, "to_role": selection.roles[0].value,
+                          "source_message_id": message.external_message_id, "source": "user"})
             binding = self.store.load_conversation(
                 message.channel, message.conversation_id
             ) or binding
@@ -480,11 +535,17 @@ class DialogueRouter:
             )
             if project_control is not None:
                 self._record_inbound(state, message, binding["active_role"])
-                return project_control
+                selected = self.store.load_project_selection(message.channel, message.conversation_id)
+                outcome = RequestOutcome.SUCCESS if selected and selected.approved else RequestOutcome.WAITING_USER
+                explicit = next((item.metadata["request_result"] for item in project_control
+                                 if "request_result" in item.metadata), None)
+                result = RequestResult.from_dict(explicit) if explicit else RequestResult(outcome, "PROJECT_SELECTION")
+                return ConversationResult(project_control, result)
             if path_input.path and path_input.request_text:
                 message = replace(message, text=path_input.request_text)
                 text = message.text.strip()
-                selection = self.role_resolver.resolve(text, binding["active_role"])
+                selection = self.role_resolver.interpret(text, binding["active_role"])
+                message = replace(message, metadata={**message.metadata, "user_intent": selection.to_dict()})
                 if selection.explicit and not selection.group_call:
                     self.store.set_conversation_role(
                         message.channel,
@@ -511,7 +572,7 @@ class DialogueRouter:
                     selection.roles[0], cancelled=cancelled,
                     approved_audit_commit=pending["commit_sha"],
                 ),)
-            if not self._is_work_intent(text) and is_long_repository_analysis_request(text):
+            if selection.task_intent == TaskIntent.ANALYZE_REPOSITORY:
                 self._record_inbound(state, message, binding["active_role"])
                 return (
                     self._start_repository_analysis(
@@ -522,28 +583,8 @@ class DialogueRouter:
                         cancelled=cancelled,
                     ),
                 )
-        if mode == ConversationMode.FREE_CHAT and self._is_work_intent(text):
-            with self.store.transaction():
-                if not binding.get("active_task_id"):
-                    binding, state = self._create_task(
-                        message,
-                        binding,
-                        include_session_context=True,
-                        cancelled=cancelled,
-                    )
-                self.store.set_conversation_mode(
-                    message.channel,
-                    message.conversation_id,
-                    ConversationMode.PLANNING.value,
-                )
-                self.store.set_conversation_role(
-                    message.channel,
-                    message.conversation_id,
-                    RoleId.DEVELOPMENT.value,
-                )
-            binding = self.store.load_conversation(
-                message.channel, message.conversation_id
-            ) or binding
+        if mode == ConversationMode.FREE_CHAT and selection.task_intent == TaskIntent.PLAN_DEVELOPMENT:
+            binding, state = self._enter_planning(message, binding, state, cancelled=cancelled)
             mode = ConversationMode.PLANNING
 
         accepted_attachments = self._accepted_attachments(message)
@@ -603,8 +644,160 @@ class DialogueRouter:
                 state, message, cancelled=cancelled
             )
             if setup_reply:
-                return (self._out(message, setup_reply, binding, state),)
+                return (self._out(message, setup_reply, binding, state,
+                                  result=RequestResult(RequestOutcome.WAITING_USER, "SETUP_REQUIRED")),)
         return (self._ask_backend(message, binding, state, cancelled=cancelled),)
+
+    def _execution_message(self, message, binding, state, input_id, *, cancelled=None):
+        entry = self.store.execution_input(input_id)
+        if (entry is None or entry['user_id'] != message.user_id or entry['message_id'] != message.external_message_id
+                or entry['channel'] != message.channel or entry['conversation_id'] != message.conversation_id
+                or not self.store.execution_input_is_current(entry)):
+            return ConversationResult((), RequestResult(RequestOutcome.CANCELLED, 'SUPERSEDED_TASK'))
+        state = self.store.load_run(entry['run_id'])
+        entries = self.store.execution_inputs(state.run_id)
+        if entry['status'] == 'RECEIVED' and entry['intent'].get('clarification_required'):
+            saved_result = RequestResult.from_dict(entry['intent']['result'])
+            return (self._out(message, entry['intent']['response_text'], binding, state, result=saved_result),)
+        if entry['status'] != 'RECEIVED':
+            self._resume_after_execution_message(state.run_id)
+            outcome = RequestOutcome.WAITING_USER if entry['status'] == 'WAITING_APPROVAL' else RequestOutcome.SUCCESS
+            return (self._out(message, entry['intent'].get('response_text', '저장된 중간 메시지의 처리 상태를 복구했습니다.'), binding, state,
+                              result=RequestResult(outcome, 'STEERING_REPLAY', entry['intent'].get('attempts'), entry['intent'].get('successes'))),)
+        self._record_inbound(state, message, entry['role_id'])
+        if self.team_backend is None:
+            text = '실행 중 메시지를 받았습니다. 현재 역할 연결이 없어 해석을 기다리며 변경을 보존합니다. 같은 범위의 뜻을 보충해 주세요.'
+            result = RequestResult(RequestOutcome.WAITING_USER, 'STEERING_PENDING')
+            self.store.request_execution_input_clarification(input_id, {'response_text': text, 'result': result.to_dict()})
+            return (self._out(message, text, binding, state, result=result),)
+        plan = self.store.load_plan_revision(state.run_id, state.plan_revision)
+        analysis = self.store.repository_analysis(state.run_id)
+        contract = StageContract.from_dict(plan['plan']['stages'][state.stage_index]) if plan else None
+        checkpoint = self.store.pipeline_workspace(state.run_id)
+        execution_state = {
+            'run_id': state.run_id, 'objective': state.objective, 'phase': state.phase.value,
+            'stage': contract.to_dict() if contract else None, 'checkpoint': checkpoint,
+            'analysis': {key: analysis[key] for key in ('request_text', 'commit_sha', 'phase', 'checkpoint', 'completed', 'remaining')} if analysis else None,
+            'previous_user_inputs': [{key: item[key] for key in ('input_id', 'text', 'status', 'intent')} for item in entries],
+            'note': '완료/미커밋 변경은 자동으로 되돌리지 않는다. 범위 확대는 별도 확인이 필요하다.',
+        }
+        role = RoleId(entry['role_id'])
+        request = TeamConversationRequest(role, self._conversation_context(message, state, role), call_purpose='execution_message',
+                                          turn_messages=({'source': 'gateway_execution_state', 'value': execution_state},))
+        replay = getattr(self.team_backend, 'replay_saved_requests', None)
+        if message.metadata.get('model_cache_replay'):
+            saved = replay(state, message) if callable(replay) else ()
+            replies = [reply for request, reply in saved if request.call_purpose == 'execution_message' and request.role_id == role]
+            if not replies:
+                return (self._out(message, '원래 중간 메시지의 확정 모델 결과를 찾지 못했습니다. 변경과 예약을 보존합니다.', binding, state,
+                                  result=RequestResult(RequestOutcome.WAITING_USER, 'STEERING_PENDING', None, None)),)
+            reply, error = replies[-1], None
+        else:
+            _, _, _, reply, error = self._run_conversation_task(message, state, request, cancelled=cancelled)
+        calls = self.store.model_calls_for_request(self.store.model_request_key(message.channel, message.conversation_id, message.external_message_id))
+        attempts = len(calls) if calls else 0 if error and isinstance(error, BudgetExceeded) else 1
+        successes = sum(item['status'] == 'COMPLETED' for item in calls) if calls else int(error is None)
+        self.store.save_conversation_result(message.channel, message.conversation_id, message.external_message_id,
+                                           RequestResult(RequestOutcome.PARTIAL, 'RUNNING', attempts, successes))
+        self._check_cancelled(cancelled)
+        if error:
+            text = '중간 메시지 해석에 실패해 현재 변경을 보존하고 확인을 기다립니다: ' + self.redactor.text(str(error))[:300] + '\n같은 승인 범위에서 요청의 뜻을 보충해 주세요.'
+            result = RequestResult(RequestOutcome.FAILED, 'EXECUTION_MESSAGE_FAILED', attempts, successes)
+            self.store.request_execution_input_clarification(input_id, {'response_text': text, 'result': result.to_dict()})
+            return (self._out(message, text, binding, state, result=result),)
+        intent = reply.execution_intent
+        if (not isinstance(intent, dict) or intent.get('action') not in {'question', 'supplement', 'redirect', 'test_first', 'scope_change'}
+                or reply.calls or reply.repository_tools or reply.memory_updates or reply.stages or reply.task_intent != TaskIntent.ANSWER):
+            text = '중간 메시지의 실행 의도를 확정하지 못했습니다. 현재 변경을 보존하고 확인을 기다립니다. 같은 승인 범위에서 요청의 뜻을 보충해 주세요.'
+            result = RequestResult(RequestOutcome.WAITING_USER, 'STEERING_PENDING', attempts, successes)
+            self.store.request_execution_input_clarification(input_id, {'response_text': text, 'result': result.to_dict()})
+            return (self._out(message, text, binding, state, result=result),)
+        from app.contracts.models import normalize_stage_scope
+        try:
+            paths = [normalize_stage_scope(path) for path in intent.get('requested_scope', [])]
+            outside = [path for path in paths if contract and not any(path == scope or path.startswith(scope + '/') for scope in contract.scope)]
+        except (ValueError, TypeError):
+            outside = list(intent.get('requested_scope', [])) or ['안전하지 않은 경로']
+        blocked = intent['action'] == 'scope_change' or bool(outside) or bool(analysis and intent['action'] == 'test_first')
+        intent = {**intent, 'response_text': self.redactor.text(reply.text), 'attempts': attempts, 'successes': successes}
+        try:
+            status = self.store.resolve_execution_input(input_id, intent, blocked=blocked)
+        except StoreError:
+            text = '보충 답변이 어떤 확인 질문을 해결하는지 확정하지 못했습니다. 기존 입력과 변경을 보존합니다. 해당 요청을 명시해 다시 설명해 주세요.'
+            result = RequestResult(RequestOutcome.WAITING_USER, 'STEERING_PENDING', attempts, successes)
+            self.store.request_execution_input_clarification(input_id, {'response_text': text, 'result': result.to_dict()})
+            return (self._out(message, text, binding, state, result=result),)
+        if status == 'SUPERSEDED':
+            return ConversationResult((), RequestResult(RequestOutcome.CANCELLED, 'SUPERSEDED_TASK'))
+        if blocked:
+            text = '요청을 받았습니다. 추가 수정 범위 확인이 필요합니다: ' + ', '.join(outside or paths or ['현재 승인 밖 작업']) + '. 현재 변경을 보존하고 실행을 멈춥니다. 승인된 범위로 지시를 고치거나 새 계획을 확인해 주세요.'
+            result = RequestResult(RequestOutcome.WAITING_USER, 'SCOPE_APPROVAL_REQUIRED', attempts, successes)
+        elif intent['action'] == 'question':
+            text, result = reply.text, RequestResult(RequestOutcome.SUCCESS, 'EXECUTION_QUESTION', attempts, successes)
+        else:
+            text = '중간 지시를 받았습니다. 다음 안전 지점에서 반영합니다. 기존 변경은 보존합니다.\n' + reply.text
+            result = RequestResult(RequestOutcome.SUCCESS, 'STEERING_RECEIVED', attempts, successes)
+        self._resume_after_execution_message(state.run_id)
+        return (self._out(message, text, binding, state, result=result),)
+
+    def _resume_after_execution_message(self, run_id):
+        # 분류/저장 완료 뒤 재시작되어도 같은 작업과 checkpoint만 자동 연결한다.
+        with self.store.transaction():
+            if any(item['status'] in {'RECEIVED', 'WAITING_APPROVAL'} for item in self.store.execution_inputs(run_id)):
+                return
+            job = self.store.pipeline_job(run_id)
+            current = self.store.load_run(run_id)
+            if job and job['status'] == 'NEEDS_ATTENTION' and job['last_error'] == 'STEERING_PENDING' and current.phase == RunPhase.PAUSED:
+                self.state_machine.transition(current, RunPhase.DEVELOPING, message='중간 메시지 해석 후 같은 작업 공간에서 계속합니다.')
+                self.store.requeue_pipeline_job(run_id)
+            analysis = self.store.repository_analysis(run_id)
+            if analysis and analysis['status'] == 'PAUSED' and analysis['stop_reason'] == 'STEERING_PENDING':
+                self.store.resume_repository_analysis(analysis['channel'], analysis['conversation_id'])
+
+    def _enter_planning(
+        self, message: IncomingMessage, binding: dict[str, str], state: RunState,
+        *, cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[dict[str, str], RunState]:
+        with self.store.transaction():
+            if not binding.get("active_task_id"):
+                binding, state = self._create_task(
+                    message,
+                    binding,
+                    include_session_context=True,
+                    cancelled=cancelled,
+                )
+            self.store.set_conversation_mode(
+                message.channel,
+                message.conversation_id,
+                ConversationMode.PLANNING.value,
+            )
+            self.store.set_conversation_role(
+                message.channel,
+                message.conversation_id,
+                RoleId.DEVELOPMENT.value,
+            )
+        binding = self.store.load_conversation(
+            message.channel, message.conversation_id
+        ) or binding
+        return binding, state
+
+    def _apply_interpreted_intent(
+        self, message: IncomingMessage, binding: dict[str, str], state: RunState,
+        role_id: RoleId, reply: AgentReply,
+        *, cancelled: Callable[[], bool] | None = None,
+    ) -> OutgoingMessage:
+        if reply.task_intent == TaskIntent.ANALYZE_REPOSITORY:
+            return self._start_repository_analysis(
+                message, binding, state, role_id, cancelled=cancelled,
+                interpreted_purpose=reply.question_purpose,
+            )
+        binding, state = self._enter_planning(message, binding, state, cancelled=cancelled)
+        with self.store.transaction():
+            state, setup_reply = self._collect_setup(state, message, cancelled=cancelled)
+        if setup_reply:
+            return self._out(message, setup_reply, binding, state,
+                             result=RequestResult(RequestOutcome.WAITING_USER, "SETUP_REQUIRED"))
+        return self._ask_backend(message, binding, state, cancelled=cancelled)
 
     def _start_repository_analysis(
         self,
@@ -615,6 +808,7 @@ class DialogueRouter:
         *,
         cancelled: Callable[[], bool] | None = None,
         approved_audit_commit: str = "",
+        interpreted_purpose: str = "",
     ) -> OutgoingMessage:
         if self.repository_analysis_scheduler is None:
             return self._out(
@@ -622,6 +816,7 @@ class DialogueRouter:
                 "장기 저장소 분석 기능이 현재 런타임에 연결되지 않았습니다.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.FAILED, "ANALYSIS_UNAVAILABLE"),
             )
         selected = self.store.load_project_selection(
             message.channel, message.conversation_id
@@ -632,6 +827,7 @@ class DialogueRouter:
                 "저장소 전반을 분석하려면 먼저 Git 프로젝트의 절대경로를 보내 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_REQUIRED"),
             )
         if selected.user_id != message.user_id or not selected.approved:
             return self._out(
@@ -640,6 +836,7 @@ class DialogueRouter:
                 f"'{self.repository_approval_phrase}'라고 말해 다시 승인해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
             )
         try:
             repository = self._validate_repository(
@@ -651,6 +848,7 @@ class DialogueRouter:
                 f"프로젝트를 다시 확인할 수 없습니다: {exc}",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_UNAVAILABLE"),
             )
         if repository.identity_hash != selected.repository_identity:
             self.store.set_current_project(
@@ -673,6 +871,7 @@ class DialogueRouter:
                 "같은 경로의 저장소 식별값이 바뀌었습니다. 프로젝트를 다시 승인한 뒤 분석을 요청해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
             )
         if repository.head_sha != selected.head_sha:
             self.store.set_current_project(
@@ -692,6 +891,7 @@ class DialogueRouter:
             return self._out(
                 message, "전체 감사 제안 뒤 저장소 커밋이 변경되었습니다. 새 범위로 다시 요청해 주세요.",
                 binding, state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "AUDIT_APPROVAL"),
             )
         request = RepositoryAnalysisRequest.create(
             channel=message.channel,
@@ -721,10 +921,12 @@ class DialogueRouter:
                 "기존 분석을 바꾸려면 '새 작업'으로 명시적으로 교체해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.PARTIAL, "ANALYSIS_ACTIVE"),
             )
         if is_full_repository_audit_request(message.text) and not approved_audit_commit:
             if self.repository_reader is None:
-                return self._out(message, "전체 감사 범위를 조회할 수 없습니다. 저장소 조회 기능을 확인해 주세요.", binding, state)
+                return self._out(message, "전체 감사 범위를 조회할 수 없습니다. 저장소 조회 기능을 확인해 주세요.", binding, state,
+                                 result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_UNAVAILABLE"))
             try:
                 manifest = self.repository_reader.pinned_manifest(
                     str(repository.path), expected_identity=repository.identity_hash,
@@ -734,7 +936,8 @@ class DialogueRouter:
             except RepositoryCancelled as exc:
                 raise ConversationCancelled(str(exc)) from exc
             except RepositoryAccessError as exc:
-                return self._out(message, f"전체 감사 범위를 확인하지 못했습니다: {exc}", binding, state)
+                return self._out(message, f"전체 감사 범위를 확인하지 못했습니다: {exc}", binding, state,
+                                 result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_READ_FAILED"))
             limits = self.repository_analysis_limits
             context_limit = max(1, (self.context.policy.max_characters - 1024) // 2)
             plan = build_repository_analysis_plan(
@@ -772,6 +975,7 @@ class DialogueRouter:
                 f"현재 한도: 묶음 {limits['max_batches']}개, 읽기 {limits['max_read_bytes']}바이트. "
                 + limits_notice + "진행하려면 24시간 안에 정확히 '전체 감사 시작해'라고 답해 주세요.",
                 binding, state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "AUDIT_APPROVAL"),
             )
         with self.store.transaction():
             self.state_machine.create_run(
@@ -782,6 +986,19 @@ class DialogueRouter:
                 repository_approved=True,
             )
             analysis, created = self.repository_analysis_scheduler.enqueue(request)
+            if created and interpreted_purpose:
+                self.logger.emit(
+                    request.analysis_id, "REPOSITORY_ANALYSIS_REQUEST_INTERPRETED",
+                    "현재 역할의 조사 목적 해석과 부모 요청 출처를 보존했습니다.",
+                    role_id=role_id.value,
+                    data={
+                        "question_purpose": interpreted_purpose,
+                        "parent_run_id": state.run_id,
+                        "source_message_id": message.external_message_id,
+                        "source": "model_interpretation",
+                        "untrusted_repository_data": True,
+                    },
+                )
             if created and approved_audit_commit:
                 self.store.clear_pending_repository_audit(
                     message.channel, message.conversation_id, message.user_id
@@ -813,6 +1030,7 @@ class DialogueRouter:
             "'상태'로 checkpoint와 범위를 확인하거나 '중지'·'재개'로 제어할 수 있습니다.",
             binding,
             state,
+            result=RequestResult(RequestOutcome.PARTIAL, "ANALYSIS_QUEUED"),
         )
 
     def _create_binding(self, message: IncomingMessage) -> dict[str, str]:
@@ -1020,6 +1238,7 @@ class DialogueRouter:
                         f"프로젝트를 선택할 수 없습니다: {exc}",
                         binding,
                         state,
+                        result=RequestResult(RequestOutcome.FAILED, "PROJECT_SELECTION_FAILED"),
                     ),
                 )
             active_analysis = (
@@ -1442,7 +1661,7 @@ class DialogueRouter:
             RunPhase.IMPROVING,
             RunPhase.VERIFYING,
             RunPhase.STAGE_COMPLETED,
-        } and self.pipeline_scheduler is not None:
+        } and self.pipeline_scheduler is not None and message.text.strip() not in {'취소', '작업 취소', '취소해', '취소해줘'}:
             pause = getattr(self.pipeline_scheduler, "pause", None)
             if callable(pause):
                 job_status = pause(state.run_id)
@@ -1463,6 +1682,31 @@ class DialogueRouter:
         else:
             text = "이미 종료되었거나 중지할 수 없는 작업입니다."
         return self._out(message, text + pending_notice, binding, state)
+
+    def _budget_control(self, message: IncomingMessage, binding) -> OutgoingMessage:
+        if binding is None or not binding.get('active_task_id') or self.budget is None:
+            return self._out(message, '예산을 변경할 개발 작업이 없습니다.', binding,
+                             result=RequestResult(RequestOutcome.FAILED, 'BUDGET_CONTROL_DENIED'))
+        state = self.store.load_run(binding['active_task_id'])
+        parts = message.text.strip().lower().split()
+        actor = dict(channel=message.channel, conversation_id=message.conversation_id,
+                     user_id=message.user_id, request_id=message.external_message_id)
+        try:
+            if message.attachments:
+                raise ValueError('첨부 없이 명령 원문으로 확인해 주세요.')
+            if parts == ['/budget_reset']:
+                self.budget.reset_budget(state.run_id, **actor)
+                text = '예산 계산 기준을 초기화했습니다. 누적 사용량·결과·초과 이벤트를 보존합니다.'
+            elif len(parts) == 3 and parts[0] == '/budget_ack':
+                self.budget.acknowledge_overrun(state.run_id, int(parts[1]), int(parts[2]), **actor)
+                text = '해당 실제 보고 초과를 확인했습니다. 같은 candidate의 수동 재개는 별도로 요청해 주세요.'
+            else:
+                raise ValueError('명령: /budget_reset 또는 /budget_ack 이벤트ID 실제보고토큰')
+        except (BudgetExceeded, ValueError) as exc:
+            return self._out(message, str(exc), binding, state,
+                             result=RequestResult(RequestOutcome.FAILED, 'BUDGET_CONTROL_DENIED'))
+        return self._out(message, text + '\n' + self.budget.render_status(state.run_id), binding, state,
+                         result=RequestResult(RequestOutcome.SUCCESS, 'CONTROL_RESPONSE'))
 
     def _resume(
         self, message: IncomingMessage, binding: dict[str, str] | None
@@ -1537,10 +1781,16 @@ class DialogueRouter:
         if not callable(resume):
             return self._out(message, "현재 실행기가 재개 기능을 지원하지 않습니다.", binding, state)
         with self.store.transaction():
+            if self.store.has_budget_anomaly(state.run_id):
+                text = '미확인 비용 또는 미확인 예약 초과 때문에 수동 재개를 차단했습니다.'
+                if self.budget is not None:
+                    text += '\n' + self.budget.render_status(state.run_id)
+                return self._out(message, text, binding, state,
+                    result=RequestResult(RequestOutcome.FAILED, 'BUDGET_ANOMALY'))
             restarted = self.state_machine.transition(
                 state,
                 RunPhase.DEVELOPING,
-                message="사용자 요청으로 현재 단계를 안전한 시작 지점에서 다시 진행합니다.",
+                message="사용자 요청으로 저장된 작업 공간과 candidate에서 현재 단계를 이어갑니다.",
             )
             job_status = resume(restarted.run_id)
             if job_status != "QUEUED":
@@ -1550,7 +1800,7 @@ class DialogueRouter:
             )
         return self._out(
             message,
-            "현재 단계를 안전한 시작 지점에서 다시 실행 큐에 넣었습니다: QUEUED",
+            "보존된 작업 공간과 candidate를 확인해 이어서 실행 큐에 넣었습니다: QUEUED",
             binding,
             restarted,
         )
@@ -1605,6 +1855,10 @@ class DialogueRouter:
             f"갱신={job['updated_at']}",
         ]
         error = self.redactor.text(str(job.get("last_error", ""))).strip()
+        result = job.get("result")
+        if result:
+            parts.append(f"요청 결과={RequestOutcome(result['outcome']).label}")
+            parts.append(RequestResult.from_dict(result).calls_text)
         if error:
             parts.append(f"중단 사유={error[:300]}")
         return " · ".join(parts)
@@ -1716,7 +1970,19 @@ class DialogueRouter:
             f"작업: {state.objective or '(미지정)'}",
             f"계획 버전: {state.plan_revision or '(미작성)'}",
             f"승인: {'완료' if state.approval_granted else '대기 또는 미요청'}",
+            f"작업 단계: {state.stage_index + 1}/{state.stage_count}",
         ]
+        checkpoint = self.store.pipeline_workspace(state.run_id)
+        if checkpoint is not None:
+            lines.append(f"현재 코드: {checkpoint['candidate_sha'][:12]} · 마지막 검증: {checkpoint['validated_sha'][:12]}")
+            if state.phase == RunPhase.PAUSED:
+                lines.append(f"보존된 작업 공간: {checkpoint['worktree']['worktree_path']}")
+        inputs = self.store.execution_inputs(state.run_id)
+        if inputs:
+            latest = inputs[-1]
+            labels = {'RECEIVED': '해석 대기', 'READY': '안전 지점 반영 대기', 'APPLIED': '반영',
+                      'ANSWERED': '질문 답변', 'WAITING_APPROVAL': '추가 범위 확인 대기', 'SUPERSEDED': '이전 요청'}
+            lines.append('중간 메시지: ' + labels[latest['status']] + ' · ' + latest['text'][:160])
         if self.pipeline_scheduler is not None:
             lines.append(
                 f"실행 큐: {self.pipeline_scheduler.status(state.run_id) or '(미등록)'}"
@@ -1726,7 +1992,7 @@ class DialogueRouter:
             lines.append("사용자 답변 필요:")
             lines.extend(f"- {item}" for item in pending_question["questions"])
         elif state.phase == RunPhase.PAUSED:
-            lines.append("재개: '재개'라고 말하면 현재 단계를 안전한 시작 지점에서 다시 진행합니다.")
+            lines.append("재개: '재개'라고 말하면 보존된 작업 공간과 candidate를 확인해 이어서 진행합니다.")
         if self.conversation_scheduler is not None:
             lines.append(
                 "대화 큐: "
@@ -2009,6 +2275,7 @@ class DialogueRouter:
                     f"프로젝트를 다시 확인할 수 없습니다: {exc}",
                     binding,
                     state,
+                    result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_UNAVAILABLE"),
                 )
             if (
                 repository.identity_hash != state.repository_identity
@@ -2048,6 +2315,7 @@ class DialogueRouter:
                     f"'{self.repository_approval_phrase}'라고 한 번 더 말해 주세요.",
                     binding,
                     discussing,
+                    result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
                 )
             expiry = self._new_repository_expiry()
             with self.store.transaction():
@@ -2077,6 +2345,7 @@ class DialogueRouter:
                 "프로젝트 사용 승인을 갱신했습니다. 계획 실행은 별도로 '개발 시작해'라고 승인해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "EXECUTION_APPROVAL"),
             )
         if state.approval_granted:
             job_status = (
@@ -2099,12 +2368,14 @@ class DialogueRouter:
                         f"저장된 승인을 확인해 실행 큐를 복구했습니다: {job_status}",
                         binding,
                         state,
+                        result=RequestResult(RequestOutcome.SUCCESS, "CONTROL_RESPONSE"),
                     )
             return self._out(
                 message,
                 f"이미 승인이 저장되었습니다. 실행 큐 상태: {job_status or '(연결 안 됨)'}",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.FAILED, "PIPELINE_UNAVAILABLE") if self.pipeline_scheduler is None else RequestResult(RequestOutcome.SUCCESS, "CONTROL_RESPONSE"),
             )
         if message.text.strip() == self.state_machine.approval_phrase:
             if not self.store.repository_is_approved(
@@ -2121,6 +2392,7 @@ class DialogueRouter:
                     f"'{self.repository_approval_phrase}'라고 말해 갱신해 주세요.",
                     binding,
                     state,
+                    result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
                 )
             try:
                 repository = self._validate_repository(
@@ -2132,6 +2404,7 @@ class DialogueRouter:
                     f"개발 승인 전에 프로젝트를 다시 확인하지 못했습니다: {exc}",
                     binding,
                     state,
+                    result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_UNAVAILABLE"),
                 )
             if (
                 repository.identity_hash != state.repository_identity
@@ -2178,6 +2451,7 @@ class DialogueRouter:
                     "계획을 만든 뒤 저장소가 바뀌었습니다. 현재 코드 기준으로 계획을 다시 확인해 주세요.",
                     binding,
                     discussing,
+                    result=RequestResult(RequestOutcome.WAITING_USER, "PLAN_REVISION_REQUIRED"),
                 )
             try:
                 self._preflight_execution_plan(state, cancelled=cancelled)
@@ -2188,6 +2462,7 @@ class DialogueRouter:
                     f"{self.redactor.text(str(exc))}",
                     binding,
                     state,
+                    result=RequestResult(RequestOutcome.FAILED, "EXECUTION_PREFLIGHT_FAILED"),
                 )
             with self.store.transaction():
                 approved = self.state_machine.approve(
@@ -2210,10 +2485,14 @@ class DialogueRouter:
                         ConversationMode.EXECUTING.value,
                     )
                     text = f"개발 승인을 저장했습니다. 실행 큐에 등록했습니다: {job_status}"
-                return self._out(message, text, binding, approved)
+                result = (RequestResult(RequestOutcome.FAILED, "PIPELINE_UNAVAILABLE")
+                          if self.pipeline_scheduler is None
+                          else RequestResult(RequestOutcome.SUCCESS, "CONTROL_RESPONSE"))
+                return self._out(message, text, binding, approved, result=result)
         if not message.text.strip().startswith("계획 수정:") and self._is_plan_question(message.text):
             return self._out(
                 message, self._explain_current_plan(state, message.text), binding, state,
+                result=RequestResult(RequestOutcome.SUCCESS, "CONTROL_RESPONSE"),
             )
         if not self._is_plan_revision_request(message.text):
             return self._out(
@@ -2224,6 +2503,7 @@ class DialogueRouter:
                 f"실행할 준비가 됐다면 정확히 '{self.state_machine.approval_phrase}'라고 말해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "EXECUTION_APPROVAL"),
             )
         with self.store.transaction():
             discussing = self.state_machine.transition(
@@ -2237,6 +2517,18 @@ class DialogueRouter:
                 source=message.user_id,
             )
         return self._ask_backend(message, binding, discussing, cancelled=cancelled)
+
+    def _budget_stop_text(self, state: RunState, successes: int) -> str:
+        text = ('설정된 대화 토큰 한도 때문에 새 답변이나 재시도를 중단했습니다. '
+                f'이번 요청의 성공 호출은 {successes}회입니다. 확보한 답변과 근거는 보존합니다.')
+        if self.budget is not None:
+            text += '\n' + self.budget.render_status(state.run_id)
+        if self.store.has_budget_anomaly(state.run_id):
+            text += '\n재개 조건: 미확인 비용 또는 예약 초과를 정산·검토한 뒤 재개 여부를 확인해야 합니다.'
+        else:
+            text += ('\n재개 조건: 문맥을 줄이거나 한도를 검토해 다음 호출의 예상 비용이 '
+                     '현재 한도에 들어가도록 한 뒤 다시 요청해 주세요.')
+        return text
 
     def _preflight_execution_plan(
         self,
@@ -2261,7 +2553,8 @@ class DialogueRouter:
             for command in contract.verification_commands
         )
         self.execution_preflight.preflight(
-            Path(state.repository), commands, operation_id=state.run_id, cancelled=cancelled
+            GitRepository(Path(state.repository)), commands,
+            operation_id=state.run_id, cancelled=cancelled
         )
 
     def _ask_backend(
@@ -2273,6 +2566,8 @@ class DialogueRouter:
         cancelled: Callable[[], bool] | None = None,
     ) -> OutgoingMessage:
         self._check_cancelled(cancelled)
+        if message.metadata.get("model_cache_replay") and not getattr(self.backend, "reserves_before_execution", False):
+            raise RuntimeError("완료 모델 결과만 사용하는 재전송 경계가 연결되지 않았습니다.")
         if not self.store.repository_is_approved(
             message.channel,
             message.conversation_id,
@@ -2287,6 +2582,7 @@ class DialogueRouter:
                 f"'{self.repository_approval_phrase}'라고 다시 승인해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
             )
         try:
             repository = self._validate_repository(
@@ -2298,6 +2594,7 @@ class DialogueRouter:
                 f"프로젝트를 안전하게 읽을 수 없습니다: {exc}",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.FAILED, "REPOSITORY_UNAVAILABLE"),
             )
         if repository.identity_hash != state.repository_identity:
             with self.store.transaction():
@@ -2323,6 +2620,7 @@ class DialogueRouter:
                 f"'{self.repository_approval_phrase}'라고 다시 승인해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.WAITING_USER, "PROJECT_APPROVAL"),
             )
         if repository.head_sha != state.repository_head_sha:
             state = self.store.save_run(
@@ -2350,6 +2648,7 @@ class DialogueRouter:
                 "설정된 토큰 한도 때문에 더 진행할 수 없습니다. 한도 설정을 확인해 주세요.",
                 binding,
                 state,
+                result=RequestResult(RequestOutcome.FAILED, "BUDGET_LIMIT", 1),
             )
         self._check_cancelled(cancelled)
         refreshed = self._current_agent_state(message, state)
@@ -2361,6 +2660,7 @@ class DialogueRouter:
                 message,
                 "에이전트가 답변하는 동안 작업 상태가 바뀌어 이전 응답을 폐기했습니다. 현재 상태에서 다시 말해 주세요.",
                 current_binding,
+                result=RequestResult(RequestOutcome.CANCELLED, "STATE_CHANGED", 1, 1),
             )
         binding, state = refreshed
         with self.store.transaction():
@@ -2373,6 +2673,12 @@ class DialogueRouter:
         state: RunState,
         reply: AgentReply,
     ) -> OutgoingMessage:
+        call_count = 0 if reply.metadata.get("cached_call") else 1
+        if reply.metadata.get("budget_stop"):
+            return self._out(message,
+                reply.text + "\n\n실제 사용량이 예약 추정을 넘어 결과를 보존하고 후속 실행을 차단했습니다. '사용량'으로 확인해 주세요.",
+                binding, state, role_id=RoleId.DEVELOPMENT.value,
+                result=RequestResult(RequestOutcome.PARTIAL, "BUDGET_LIMIT", call_count, call_count))
         selected = self.store.load_project_selection(
             message.channel, message.conversation_id
         )
@@ -2427,7 +2733,8 @@ class DialogueRouter:
                 f"'{self.state_machine.approval_phrase}'라고 말해 주세요."
             )
             return self._out(
-                message, text, binding, state, role_id=RoleId.DEVELOPMENT.value
+                message, text, binding, state, role_id=RoleId.DEVELOPMENT.value,
+                result=RequestResult(RequestOutcome.WAITING_USER, "EXECUTION_APPROVAL", call_count, call_count),
             )
         return self._out(
             message,
@@ -2435,6 +2742,7 @@ class DialogueRouter:
             binding,
             state,
             role_id=RoleId.DEVELOPMENT.value,
+            result=RequestResult(RequestOutcome.SUCCESS, attempts=call_count, successes=call_count),
         )
 
     @staticmethod
@@ -2507,8 +2815,18 @@ class DialogueRouter:
         *,
         group_call: bool,
         cancelled: Callable[[], bool] | None = None,
-    ) -> tuple[OutgoingMessage, ...]:
+    ) -> tuple[OutgoingMessage, ...] | ConversationResult:
         self._check_cancelled(cancelled)
+        if message.metadata.get("model_cache_replay") and not getattr(self.team_backend, "reserves_before_execution", False):
+            raise RuntimeError("완료 모델 결과만 사용하는 재전송 경계가 연결되지 않았습니다.")
+        previous = self.store.conversation_result(message.channel, message.conversation_id,
+                                                  message.external_message_id)
+        if message.metadata.get("model_cache_replay") or (previous and previous.reason in {"RUNNING", "PROCESSING_FAILED"}):
+            records = [event["data"] for event in self.store.list_events(state.run_id)
+                       if event["event_type"] == "AGENT_CONSULTATION_REQUESTED"
+                       and event["data"]["source_message_id"] == message.external_message_id]
+            if records:
+                return self._replay_consultations(message, binding, state, records, cancelled=cancelled)
         if self.team_backend is None:
             return tuple(
                 self._free_chat_foundation_reply(message, binding, state, role_id)
@@ -2528,15 +2846,19 @@ class DialogueRouter:
             message, binding, state, cancelled=cancelled
         )
         if repository_notice:
+            result = RequestResult.from_dict(repository_context["request_result"]) if "request_result" in repository_context else RequestResult(RequestOutcome.WAITING_USER, "REPOSITORY_UNAVAILABLE")
             self._update_conversation_progress(
                 message,
                 progress,
                 completed_steps=1,
                 active_step=2,
                 detail=repository_notice,
-                outcome="attention",
+                outcome=result.outcome.value,
             )
-            return (self._out(message, repository_notice, binding, state),)
+            return ConversationResult(
+                (self._out(message, repository_notice, binding, state),),
+                result,
+            )
 
         self._update_conversation_progress(
             message,
@@ -2564,9 +2886,11 @@ class DialogueRouter:
             len(selected_roles), self.max_auto_agent_replies
         )
         try:
-            self.team_backend.preflight(
-                state, largest_context, message, initial_reply_count
-            )
+            # 영속 호출은 정확한 입력의 cache 확인 뒤 예약 경계에서 예산을 검사한다.
+            if not getattr(self.team_backend, "reserves_before_execution", False):
+                self.team_backend.preflight(
+                    state, largest_context, message, initial_reply_count
+                )
         except BudgetExceeded:
             self._update_conversation_progress(
                 message,
@@ -2574,31 +2898,137 @@ class DialogueRouter:
                 completed_steps=2,
                 active_step=3,
                 detail="설정된 대화 토큰 한도 때문에 분석을 시작하지 못했습니다.",
-                outcome="attention",
+                outcome="failed",
             )
             return (
                 self._out(
                     message,
-                    "설정된 대화 토큰 한도 때문에 답변을 시작하지 않았습니다. 한도 설정을 확인해 주세요.",
+                    self._budget_stop_text(state, 0),
                     binding,
                     state,
+                    result=RequestResult(RequestOutcome.FAILED, "BUDGET_LIMIT"),
                 ),
             )
 
         tasks: list[_QueuedConversationTask] = [
             _QueuedConversationTask(role_id, None, "", repository_context)
-            for role_id in selected_roles
+            for role_id in selected_roles[:initial_reply_count]
         ]
         outputs: list[OutgoingMessage] = []
         turn_messages: list[dict] = []
-        scheduled_edges: set[tuple[RoleId, RoleId]] = set()
+        scheduled_edges: set[tuple[RoleId, RoleId, str]] = set()
+        consultations: dict[str, dict] = {}
+        consultation_parents: dict[str, _QueuedConversationTask] = {}
+        role_slots = initial_reply_count
         attempt_count = 0
-        capped = False
+        success_count = 0
+        completed_reply_count = 0
+        incomplete_reason = ""
+        capped = len(selected_roles) > initial_reply_count
         budget_blocked = False
+        awaiting_user = False
+        loop_started = time.monotonic()
+        seen_tools: set[tuple] = set()
+        final_roles: set[RoleId] = set()
+        empty_rounds: dict[RoleId, int] = {}
+        retry_allowance = sum(self.budget.policy.retries.values()) if self.budget else 2
+        max_loop_calls = self.max_auto_agent_replies * (self.max_repository_tool_rounds + 2) + retry_allowance
 
-        while tasks and attempt_count < self.max_auto_agent_replies:
-            self._check_cancelled(cancelled)
-            remaining = self.max_auto_agent_replies - attempt_count
+        def consultation_result(task, text, status, reason="", *, untrusted=False, marker=None):
+            nonlocal incomplete_reason
+            record = consultations[task.consultation_id]
+            if record["status"] != "RUNNING":
+                return
+            if status != "COMPLETED":
+                incomplete_reason = incomplete_reason or reason or "CONSULTATION_PARTIAL"
+            record.update(status=status, reason=reason, text=text,
+                          untrusted_repository_data=untrusted or record.get("untrusted_repository_data", False), **(marker or {}))
+            with self.store.transaction():
+                self.context.add_message(state.run_id, task.role_id.value, text,
+                    kind="consultation_result", data={**self._repository_context_marker(message), **record,
+                        "external_message_id": message.external_message_id})
+                self.logger.emit(state.run_id, "AGENT_CONSULTATION_FINISHED",
+                    "상담 결과와 종료 사유를 요청자에게 반환했습니다.",
+                    role_id=task.role_id.value, status=status, data=record)
+            turn_messages.append({"role_id": task.role_id.value, "text": text,
+                "called_by": record["from_role"], "kind": "consultation_result", **record})
+            parent = consultation_parents[task.consultation_id]
+            tasks.insert(0, replace(parent, purpose="consultation_return" if status == "COMPLETED" else "consultation_final"))
+
+        def owner_summary(reason):
+            owner = RoleId(binding["active_role"])
+            results = [f"{self.role_names.get(item['to_role'], item['to_role'])}: "
+                       f"{item['status']} ({item.get('reason') or '응답 확보'})\n"
+                       f"{item.get('text', '')[:1200]}" for item in consultations.values()]
+            if not consultations:
+                results.extend(f"{item.get('display_name', item['role_id'])}: {item['text'][:1200]}"
+                               for item in turn_messages if item.get("kind") is None)
+                results.extend(f"{self.role_names.get(role.value, role.value)}: 호출 한도로 미실행입니다."
+                               for role in selected_roles[initial_reply_count:])
+            text = f"상담을 부분 종료했습니다 ({reason}). 확보한 결과와 미확인 항목을 정리합니다."
+            if results:
+                text += "\n" + "\n".join(results)
+            untrusted = any(item.get("untrusted_repository_data") for item in (*consultations.values(), *turn_messages))
+            return self._out(message, text, binding, state, role_id=owner.value,
+                untrusted_repository_data=untrusted,
+                repository_marker=self._repository_reply_marker(largest_context, tuple(turn_messages)) if untrusted else None)
+
+        def check_cancelled(*, force=False):
+            if not force and (cancelled is None or not cancelled()):
+                return
+            if consultations or group_call:
+                for consultation_id, record in consultations.items():
+                    if record["status"] == "RUNNING":
+                        parent = consultation_parents[consultation_id]
+                        consultation_result(replace(parent, role_id=RoleId(record["to_role"]),
+                            consultation_id=consultation_id), "취소 시점의 응답을 확인할 수 없어 미확인입니다.",
+                            "CANCELLED", "USER_CANCELLED",
+                            untrusted=bool(parent.repository_context.get("untrusted_repository_data")))
+                summary = owner_summary("USER_CANCELLED")
+                self._update_conversation_progress(message, progress, completed_steps=3,
+                    active_step=4, detail=summary.text, outcome="cancelled", force_terminal=True)
+                self.store.save_conversation_result(message.channel, message.conversation_id,
+                    message.external_message_id,
+                    RequestResult(RequestOutcome.CANCELLED, "USER_CANCELLED", attempt_count, success_count))
+            raise ConversationCancelled("사용자가 대화 요청을 중지했습니다.")
+
+        def request_context(task):
+            context = (initial_context_by_role[task.role_id]
+                if task.purpose == "" and task.caller_role is None and task.repository_tool_round == 0
+                else self._conversation_context(message, state, task.role_id,
+                                                repository_context=task.repository_context))
+            record = consultations.get(task.consultation_id)
+            if record and record["mode"] == "independent" and task.purpose not in {"consultation_return", "consultation_final"}:
+                context = replace(context, recent_messages=tuple(item for item in context.recent_messages
+                    if not (item.get("data", {}).get("external_message_id") == message.external_message_id
+                            and item.get("kind") != "user_message")))
+            return context
+
+        def request_messages(task):
+            if task.caller_role is None and task.purpose == "" and len(selected_roles) > 1:
+                return ()
+            record = consultations.get(task.consultation_id)
+            independent = record and record["mode"] == "independent" and task.purpose not in {"consultation_return", "consultation_final"}
+            messages = [] if independent else list(turn_messages)
+            if record:
+                messages.append({"kind": "consultation_request", **record})
+            return tuple(messages)
+
+        def finish_investigation(task, reason):
+            nonlocal incomplete_reason
+            incomplete_reason = reason
+            if task.role_id not in final_roles:
+                final_roles.add(task.role_id)
+                tasks.insert(0, replace(task, purpose="agent_loop_final",
+                    repository_context={**task.repository_context, "agent_loop_stop_reason": reason}))
+
+        while tasks and attempt_count < max_loop_calls:
+            check_cancelled()
+            if time.monotonic() - loop_started >= self.max_agent_loop_seconds and tasks[0].purpose != "agent_loop_final":
+                pending = tasks.pop(0)
+                tasks.clear()
+                finish_investigation(pending, "TIME_LIMIT")
+            remaining = max_loop_calls - attempt_count
             is_initial_group = (
                 group_call
                 and attempt_count == 0
@@ -2609,7 +3039,6 @@ class DialogueRouter:
             batch_size = min(len(tasks), remaining) if is_initial_group else 1
             batch = tasks[:batch_size]
             del tasks[:batch_size]
-            turn_snapshot = tuple(turn_messages)
             indexed_batch = tuple(
                 (task, attempt_count + offset + 1)
                 for offset, task in enumerate(batch)
@@ -2626,35 +3055,31 @@ class DialogueRouter:
                 detail=(
                     f"{role_labels} 분석 중 · 모델 호출 "
                     f"{attempt_count + 1}~{attempt_count + len(batch)}회 · "
-                    f"최대 {self.max_auto_agent_replies}회"
+                    f"조회·상담·재시도 한도 별도 적용"
                     if len(batch) > 1
                     else f"{role_labels} 분석 중 · 모델 호출 "
-                    f"{attempt_count + 1}회 · 최대 {self.max_auto_agent_replies}회"
+                    f"{attempt_count + 1}회 · 조회·상담·재시도 한도 별도 적용"
                 ),
             )
             requests = tuple(
                 TeamConversationRequest(
                     role_id=task.role_id,
-                    context=(
-                        initial_context_by_role[task.role_id]
-                        if attempt_count == 0
-                        and task.caller_role is None
-                        and task.repository_tool_round == 0
-                        else self._conversation_context(
-                            message,
-                            state,
-                            task.role_id,
-                            repository_context=task.repository_context,
-                        )
-                    ),
+                    context=request_context(task),
                     caller_role=task.caller_role,
                     call_purpose=task.purpose,
-                    turn_messages=turn_snapshot,
+                    turn_messages=request_messages(task),
                     call_index=call_index,
+                    reserve_final_answer=(repository_required or bool(message.metadata.get("user_intent", {}).get("allowed_delegate_roles")))
+                        and task.purpose not in {"agent_loop_final", "consultation_return", "consultation_final"},
                 )
                 for task, call_index in indexed_batch
             )
             batch_responder = getattr(self.team_backend, "respond_batch", None)
+            self.store.save_conversation_result(
+                message.channel, message.conversation_id, message.external_message_id,
+                RequestResult(RequestOutcome.PARTIAL, "RUNNING",
+                              attempt_count + len(batch), success_count),
+            )
             parallel = (
                 is_initial_group
                 and len(batch) > 1
@@ -2743,9 +3168,15 @@ class DialogueRouter:
                     for request, task in zip(requests, batch, strict=True)
                 ]
                 model_calls = len(attempts)
-            self._check_cancelled(cancelled)
+            attempt_count += model_calls
+            check_cancelled()
             refreshed = self._current_agent_state(message, state)
             if refreshed is None:
+                for consultation_id, record in consultations.items():
+                    if record["status"] == "RUNNING":
+                        consultation_result(replace(consultation_parents[consultation_id],
+                            role_id=RoleId(record["to_role"]), consultation_id=consultation_id),
+                            "부모 작업 상태가 바뀌어 결과를 폐기했습니다.", "CANCELLED", "STATE_CHANGED")
                 current_binding = self.store.load_conversation(
                     message.channel, message.conversation_id
                 )
@@ -2755,17 +3186,18 @@ class DialogueRouter:
                     completed_steps=2,
                     active_step=3,
                     detail="분석 중 작업 상태가 바뀌어 이전 응답을 폐기했습니다.",
-                    outcome="attention",
+                    outcome="cancelled",
                 )
                 return (
                     self._out(
                         message,
                         "에이전트가 답변하는 동안 작업 상태가 바뀌어 이전 응답을 폐기했습니다. 현재 상태에서 다시 말해 주세요.",
                         current_binding,
+                        result=RequestResult(RequestOutcome.CANCELLED, "STATE_CHANGED",
+                                             attempt_count, success_count),
                     ),
                 )
             binding, state = refreshed
-            attempt_count += model_calls
             if parallel:
                 succeeded = sum(1 for item in attempts if item[4] is None)
                 self.logger.emit(
@@ -2790,11 +3222,27 @@ class DialogueRouter:
                     },
                 )
 
-            for role_id, caller_role, purpose, reply, error, task in attempts:
+            for attempt, request in zip(attempts, requests, strict=True):
+                role_id, caller_role, purpose, reply, error, task = attempt
                 if isinstance(error, BudgetExceeded):
                     budget_blocked = True
+                    if task.consultation_id:
+                        consultation_result(task, "예산 한도로 응답을 얻지 못했습니다.", "PARTIAL", "BUDGET_LIMIT")
+                    elif consultations:
+                        outputs.append(owner_summary((incomplete_reason + ";" if incomplete_reason else "") + "BUDGET_LIMIT"))
+                    if purpose != "agent_loop_final" and task.repository_context:
+                        if not consultations:
+                            finish_investigation(task, "BUDGET_LIMIT")
                     continue
                 if error is not None:
+                    stop_reason = incomplete_reason
+                    incomplete_reason = "MODEL_FAILED"
+                    if task.consultation_id:
+                        consultation_result(task, "상담 응답 실패로 해당 의견은 미확인입니다.", "FAILED", "MODEL_FAILED")
+                        continue
+                    if consultations:
+                        outputs.append(owner_summary((stop_reason + ";" if stop_reason else "") + "MODEL_FAILED"))
+                        continue
                     with self.store.transaction():
                         self.logger.emit(
                             state.run_id,
@@ -2817,9 +3265,83 @@ class DialogueRouter:
                         )
                     continue
                 assert reply is not None
+                completed_reply_count += 1
+                success_count += int(not reply.metadata.get("cached_call"))
+                if reply.metadata.get("budget_stop"):
+                    budget_blocked = True
+                    reply = replace(reply, repository_tools=(), calls=(), memory_updates=(),
+                                    text=reply.text or "예산 추정을 넘어 추가 조사를 중단했습니다. 확인된 근거는 대화에 보존했습니다.")
+                if purpose == "consultation_final":
+                    reply = replace(reply, repository_tools=(), calls=(), memory_updates=(),
+                                    task_intent=TaskIntent.ANSWER)
+                prior_context = request.context
+                repository_marker = self._repository_reply_marker(
+                    prior_context, request.turn_messages
+                )
+                source_untrusted = bool(task.repository_context.get("untrusted_repository_data")) or bool(
+                    prior_context.evidence
+                ) or any(
+                    item.get("data", {}).get("untrusted_repository_data", False)
+                    for item in prior_context.recent_messages
+                ) or any(
+                    item.get("untrusted_repository_data", False)
+                    for item in request.turn_messages
+                )
+                repository_safety_context = (
+                    task.repository_context if task.repository_context
+                    else {"untrusted_repository_data": source_untrusted}
+                )
+
+                user_intent = message.metadata.get("user_intent", {})
+                self.logger.emit(
+                    state.run_id, "USER_INTENT_INTERPRETED", "현재 역할이 대화 문맥의 요청 목적을 해석했습니다.",
+                    role_id=role_id.value,
+                    data={**user_intent, "task_intent": reply.task_intent.value,
+                          "write_forbidden": bool(user_intent.get("write_forbidden") or reply.write_forbidden),
+                          "question_purpose": reply.question_purpose or user_intent.get("question_purpose", ""),
+                          "source": "model_interpretation", "untrusted_repository_data": source_untrusted},
+                )
+                if (
+                    caller_role is None and not group_call and purpose not in {"agent_loop_final", "consultation_return", "consultation_final"} and not budget_blocked
+                    and reply.task_intent != TaskIntent.ANSWER
+                    and not reply.repository_tools
+                    and not (reply.task_intent == TaskIntent.PLAN_DEVELOPMENT and (
+                        user_intent.get("write_forbidden") or reply.write_forbidden
+                    ))
+                    and not (reply.task_intent == TaskIntent.ANALYZE_REPOSITORY
+                             and user_intent.get("read_forbidden"))
+                ):
+                    output = self._apply_interpreted_intent(
+                        message, binding, state, role_id, reply, cancelled=cancelled,
+                    )
+                    child = RequestResult.from_dict(output.metadata["request_result"]) if "request_result" in output.metadata else RequestResult(RequestOutcome.SUCCESS, "CONTROL_RESPONSE")
+                    result = replace(child, attempts=attempt_count + (child.attempts or 0),
+                                     successes=success_count + (child.successes or 0))
+                    self._update_conversation_progress(
+                        message, progress, completed_steps=3, active_step=4,
+                        detail="대화 문맥에 따른 요청을 기존 승인 검사로 전달했습니다.",
+                        outcome=result.outcome.value,
+                    )
+                    return ConversationResult((output,), result)
 
                 if reply.repository_tools:
+                    if purpose == "agent_loop_final":
+                        text = reply.text or "추가 행동 없이 부분 결과를 마무리했습니다. 확인한 근거는 대화에 보존했습니다."
+                        if task.consultation_id:
+                            consultation_result(task, text, "PARTIAL", incomplete_reason,
+                                untrusted=source_untrusted, marker=repository_marker)
+                        else:
+                            outputs.append(self._out(message, text,
+                                binding, state, role_id=role_id.value, untrusted_repository_data=source_untrusted,
+                                repository_marker=repository_marker if source_untrusted else None))
+                        continue
+                    keys = {(role_id, task.repository_context.get("head_sha", ""),
+                             json.dumps(item.to_dict(), sort_keys=True)) for item in reply.repository_tools}
+                    if keys & seen_tools:
+                        finish_investigation(task, "NO_PROGRESS")
+                        continue
                     if task.repository_tool_round >= self.max_repository_tool_rounds:
+                        incomplete_reason = "TOOL_ROUND_LIMIT"
                         self.logger.emit(
                             state.run_id,
                             "REPOSITORY_TOOL_ROUND_LIMIT_REACHED",
@@ -2828,18 +3350,9 @@ class DialogueRouter:
                             status="NEEDS_ATTENTION",
                             data={"round": task.repository_tool_round},
                         )
-                        outputs.append(
-                            self._out(
-                                message,
-                                "안전한 저장소 상세 조회 횟수 제한에 도달했습니다. 범위를 더 좁혀 다음 메시지로 물어봐 주세요.",
-                                binding,
-                                state,
-                            )
-                        )
+                        finish_investigation(task, "TOOL_ROUND_LIMIT")
                         continue
-                    if attempt_count + len(tasks) >= self.max_auto_agent_replies:
-                        capped = True
-                        continue
+                    seen_tools.update(keys)
                     self.logger.emit(
                         state.run_id,
                         "REPOSITORY_TOOLS_REQUESTED",
@@ -2866,21 +3379,35 @@ class DialogueRouter:
                             f"/{self.max_repository_tool_rounds}"
                         ),
                     )
-                    next_repository_context, tool_notice = (
-                        self._repository_tool_context_for_chat(
-                            message,
-                            state,
-                            role_id,
-                            task.repository_context,
-                            reply.repository_tools,
-                            tool_round=task.repository_tool_round + 1,
-                            cancelled=cancelled,
+                    try:
+                        next_repository_context, tool_notice = (
+                            self._repository_tool_context_for_chat(
+                                message,
+                                state,
+                                role_id,
+                                task.repository_context,
+                                reply.repository_tools,
+                                tool_round=task.repository_tool_round + 1,
+                                cancelled=cancelled,
+                            )
                         )
-                    )
+                    except ConversationCancelled:
+                        check_cancelled(force=True)
                     if tool_notice:
-                        outputs.append(
-                            self._out(message, tool_notice, binding, state)
-                        )
+                        incomplete_reason = "REPOSITORY_TOOL_FAILED"
+                        if task.consultation_id:
+                            consultation_result(task, tool_notice, "FAILED", incomplete_reason,
+                                untrusted=source_untrusted, marker=repository_marker)
+                        else:
+                            outputs.append(self._out(message, tool_notice, binding, state))
+                        continue
+                    results = next_repository_context.get("tool_results", [{}])[-1].get("results", [])
+                    gained_evidence = any(item.get("status") == "ok" and (
+                        item.get("data", {}).get("content") or item.get("data", {}).get("matches")
+                    ) for item in results)
+                    empty_rounds[role_id] = 0 if gained_evidence else empty_rounds.get(role_id, 0) + 1
+                    if empty_rounds[role_id] >= 2:
+                        finish_investigation(replace(task, repository_context=next_repository_context), "NO_PROGRESS")
                         continue
                     tasks.insert(
                         0,
@@ -2890,11 +3417,12 @@ class DialogueRouter:
                             purpose,
                             next_repository_context,
                             task.repository_tool_round + 1,
+                            task.consultation_id,
                         ),
                     )
                     continue
 
-                if task.repository_context and reply.memory_updates:
+                if source_untrusted and reply.memory_updates:
                     self.logger.emit(
                         state.run_id,
                         "REPOSITORY_CONTEXT_MEMORY_UPDATES_BLOCKED",
@@ -2907,64 +3435,28 @@ class DialogueRouter:
                     )
                     reply = replace(reply, memory_updates=())
 
-                with self.store.transaction():
-                    self._save_memory_updates(message, state, reply, role_id)
-                    outputs.append(
-                        self._out(
-                            message,
-                            reply.text,
-                            binding,
-                            state,
-                            role_id=role_id.value,
-                            untrusted_repository_data=bool(
-                                task.repository_context.get(
-                                    "untrusted_repository_data", False
-                                )
-                            ),
-                        )
-                    )
-                    turn_messages.append(
-                        {
-                            "role_id": role_id.value,
-                            "display_name": self.role_names.get(role_id.value, role_id.value),
-                            "text": reply.text,
-                            "called_by": caller_role.value if caller_role else "user",
-                            "untrusted_repository_data": bool(
-                                task.repository_context.get(
-                                    "untrusted_repository_data", False
-                                )
-                            ),
-                        }
-                    )
-                    self.store.set_conversation_role(
-                        message.channel, message.conversation_id, role_id.value
-                    )
-                    self.logger.emit(
-                        state.run_id,
-                        "AGENT_CONVERSATION_COMPLETED",
-                        "자유 대화 에이전트 답변을 완료했습니다.",
-                        stage_id=f"chat-{message.external_message_id}"[:80],
-                        role_id=role_id.value,
-                        status="COMPLETED",
-                        data={
-                            "reply_index": len(turn_messages),
-                            "caller_role": caller_role.value if caller_role else "user",
-                            "call_purpose": purpose,
-                            "usage": reply.usage.to_dict(),
-                            **reply.metadata,
-                        },
-                    )
-
+                if reply.needs_user_input:
+                    reply = replace(reply, calls=(), text=reply.text + "\n" + "\n".join(reply.needs_user_input))
+                    if not task.consultation_id:
+                        awaiting_user = True
+                        tasks.clear()
+                scheduled = False
                 for call in reply.calls:
                     if call.from_role != role_id:
                         continue
                     guarded_call = self._guard_repository_call(
-                        message, state, role_id, call, task.repository_context
+                        message, state, role_id, call, repository_safety_context
                     )
                     if guarded_call is None:
                         continue
-                    edge = (role_id, guarded_call.to_role)
-                    if edge in scheduled_edges:
+                    edge = (role_id, guarded_call.to_role, guarded_call.mode)
+                    ancestors = {role_id}
+                    ancestor = task
+                    while ancestor.consultation_id:
+                        ancestor = consultation_parents[ancestor.consultation_id]
+                        ancestors.add(ancestor.role_id)
+                    if edge in scheduled_edges or guarded_call.to_role in ancestors:
+                        incomplete_reason = "CONSULTATION_REPEAT" if edge in scheduled_edges else "CONSULTATION_CYCLE"
                         self.logger.emit(
                             state.run_id,
                             "AGENT_CONSULTATION_REPEAT_BLOCKED",
@@ -2977,18 +3469,51 @@ class DialogueRouter:
                             },
                         )
                         continue
-                    if attempt_count + len(tasks) >= self.max_auto_agent_replies:
+                    if purpose in {"agent_loop_final", "consultation_final"} or budget_blocked:
+                        continue
+                    if role_slots >= self.max_auto_agent_replies:
                         capped = True
                         continue
+                    if guarded_call.mode == "discussion" and not any(
+                        item["status"] == "COMPLETED" and item["from_role"] == role_id.value
+                        for item in consultations.values()
+                    ):
+                        incomplete_reason = "DISCUSSION_WITHOUT_RESULT"
+                        continue
                     scheduled_edges.add(edge)
-                    tasks.append(
+                    role_slots += 1
+                    consultation_id = f"{message.external_message_id}:consult-{len(consultations) + 1}"
+                    consultation_parents[consultation_id] = task
+                    evidence_refs = [item.get("data", {}).get("source_ref") or item.get("data", {}).get("evidence_key", "")
+                                     for item in prior_context.evidence]
+                    consultations[consultation_id] = {
+                        "consultation_id": consultation_id, "parent_consultation_id": task.consultation_id,
+                        "parent_run_id": state.run_id, "source_message_id": message.external_message_id,
+                        "from_role": role_id.value, "to_role": guarded_call.to_role.value,
+                        "purpose": guarded_call.purpose, "mode": guarded_call.mode,
+                        "question": guarded_call.purpose,
+                        "evidence_refs": evidence_refs, "status": "RUNNING",
+                        **self._repository_context_marker(message),
+                        "termination_condition": "단일 응답 또는 조회·협업·시간·비용·취소 경계",
+                        "limits": {"role_calls": self.max_auto_agent_replies,
+                                   "lookup_rounds": self.max_repository_tool_rounds,
+                                   "loop_seconds": self.max_agent_loop_seconds},
+                        "untrusted_repository_data": source_untrusted,
+                        **(repository_marker if source_untrusted else {}),
+                    }
+                    self.logger.emit(state.run_id, "AGENT_CONSULTATION_REQUESTED",
+                        "부모 작업과 근거를 연결한 상담을 시작했습니다.",
+                        role_id=role_id.value, status="RUNNING", data=consultations[consultation_id])
+                    tasks.insert(0,
                         _QueuedConversationTask(
                             guarded_call.to_role,
                             role_id,
                             guarded_call.purpose,
                             task.repository_context,
+                            consultation_id=consultation_id,
                         )
                     )
+                    scheduled = True
                     outputs.append(
                         self._agent_call_out(
                             message,
@@ -2997,11 +3522,8 @@ class DialogueRouter:
                             role_id,
                             guarded_call.to_role,
                             guarded_call.purpose,
-                            untrusted_repository_data=bool(
-                                task.repository_context.get(
-                                    "untrusted_repository_data", False
-                                )
-                            ),
+                            untrusted_repository_data=source_untrusted,
+                            repository_marker=repository_marker if source_untrusted else None,
                         )
                     )
                     self._update_conversation_progress(
@@ -3012,21 +3534,75 @@ class DialogueRouter:
                         detail=(
                             f"{self.role_names.get(role_id.value, role_id.value)} → "
                             f"{self.role_names.get(guarded_call.to_role.value, guarded_call.to_role.value)} "
-                            "협업 응답을 준비합니다."
+                            f"상담 이유: {guarded_call.purpose}"
                         ),
                     )
 
+                with self.store.transaction():
+                    self.logger.emit(state.run_id, "AGENT_CONVERSATION_COMPLETED",
+                        "역할 응답을 완료했습니다.", stage_id=f"chat-{message.external_message_id}"[:80],
+                        role_id=role_id.value, status="COMPLETED",
+                        data={"caller_role": caller_role.value if caller_role else "user",
+                              "call_purpose": purpose, "consultation_id": task.consultation_id,
+                              "usage": reply.usage.to_dict(), **reply.metadata})
+                    if scheduled:
+                        # 요청자의 중간 문장은 진행 요약이다. 종합 전 본문을 반복 전송하지 않는다.
+                        self.context.add_message(state.run_id, role_id.value, reply.text,
+                            kind="consultation_proposal", data={
+                                "external_message_id": message.external_message_id,
+                                "untrusted_repository_data": source_untrusted,
+                                **self._repository_context_marker(message), **repository_marker})
+                        turn_messages.append({"kind": "consultation_proposal", "role_id": role_id.value,
+                            "text": reply.text, "untrusted_repository_data": source_untrusted, **repository_marker})
+                    elif task.consultation_id:
+                        consultations[task.consultation_id]["evidence_refs"] = list(dict.fromkeys(
+                            consultations[task.consultation_id]["evidence_refs"] + [
+                                item.get("data", {}).get("source_ref") or item.get("data", {}).get("evidence_key", "")
+                                for item in prior_context.evidence]))
+                        status = "WAITING_USER" if reply.needs_user_input else "PARTIAL" if reply.calls or budget_blocked or incomplete_reason or capped or purpose in {"agent_loop_final", "consultation_final"} else "COMPLETED"
+                        consultation_result(task, reply.text, status,
+                            "USER_QUESTION" if reply.needs_user_input else "BUDGET_LIMIT" if budget_blocked else incomplete_reason or ("CALL_LIMIT" if capped else ""),
+                            untrusted=source_untrusted, marker=repository_marker)
+                    else:
+                        self._save_memory_updates(message, state, reply, role_id)
+                        final_text = reply.text
+                        if (reply.calls or purpose == "consultation_final") and (capped or incomplete_reason or budget_blocked):
+                            final_text += f"\n추가 상담을 중단했습니다 ({'CALL_LIMIT' if capped else incomplete_reason or 'BUDGET_LIMIT'})."
+                        outputs.append(self._out(message, final_text, binding, state,
+                            role_id=role_id.value, untrusted_repository_data=source_untrusted,
+                            repository_marker=repository_marker if source_untrusted else None))
+                        turn_messages.append({"role_id": role_id.value,
+                            "display_name": self.role_names.get(role_id.value, role_id.value),
+                            "text": reply.text, "called_by": "user",
+                            "untrusted_repository_data": source_untrusted, **repository_marker})
+
         if tasks:
             capped = True
+            if consultations:
+                for consultation_id, record in consultations.items():
+                    if record["status"] == "RUNNING":
+                        consultation_result(replace(consultation_parents[consultation_id],
+                            role_id=RoleId(record["to_role"]), consultation_id=consultation_id),
+                            "상담 실행 한도로 미확인입니다.", "PARTIAL", "CALL_LIMIT")
+                outputs.append(owner_summary("CALL_LIMIT"))
+        if group_call and (incomplete_reason or capped or budget_blocked) and not consultations:
+            outputs.append(owner_summary(incomplete_reason or ("CALL_LIMIT" if capped else "BUDGET_LIMIT")))
         if budget_blocked:
             outputs.append(
                 self._out(
                     message,
-                    "설정된 대화 토큰 한도 때문에 일부 답변이나 재시도를 중단했습니다.",
+                    self._budget_stop_text(state, success_count),
                     binding,
                     state,
                 )
             )
+        if not turn_messages and incomplete_reason:
+            references = [item.get("data", {}).get("source_ref", "")
+                          for item in self.store.list_messages(state.run_id)
+                          if item["kind"] == "repository_evidence"]
+            outputs.append(self._out(message,
+                f"조사를 부분 종료했습니다 ({incomplete_reason}). 확인된 근거를 대화에 보존했습니다.\n"
+                + "\n".join(references[-8:]), binding, state))
         if capped:
             outputs.append(
                 self._out(
@@ -3036,20 +3612,100 @@ class DialogueRouter:
                     state,
                 )
             )
-        self._check_cancelled(cancelled)
+        check_cancelled()
+        reason = "USER_QUESTION" if awaiting_user else "BUDGET_LIMIT" if budget_blocked else ("CALL_LIMIT" if capped else incomplete_reason)
+        outcome = (
+            RequestOutcome.WAITING_USER if awaiting_user
+            else RequestOutcome.PARTIAL if reason and completed_reply_count
+            else RequestOutcome.FAILED if reason
+            else RequestOutcome.SUCCESS
+        )
+        result = RequestResult(outcome, reason, attempt_count, success_count)
         self._update_conversation_progress(
             message,
             progress,
             completed_steps=4,
             active_step=4,
-            detail=(
-                f"답변 {len(outputs)}건을 정리해 전송합니다."
-                if outputs
-                else "처리 결과를 정리해 전송합니다."
-            ),
-            outcome="completed",
+            detail=result.calls_text + (f"\n종료 사유: {reason}" if reason else "")
+                   + "\n처리 결과를 발신함에 전달합니다.",
+            outcome=outcome.value,
         )
-        return tuple(outputs)
+        return ConversationResult(tuple(outputs), result)
+
+    def _replay_consultations(self, message, binding, state, records, *, cancelled=None):
+        self._check_cancelled(cancelled)
+        saved = self.team_backend.replay_saved_requests(state, message)
+        finished = {event["data"]["consultation_id"]: event["data"]
+                    for event in self.store.list_events(state.run_id)
+                    if event["event_type"] == "AGENT_CONSULTATION_FINISHED"
+                    and event["data"]["source_message_id"] == message.external_message_id}
+        results = []
+        for record in records:
+            if RoleId(record["to_role"]) not in self.role_resolver.interpret(
+                    message.text, binding["active_role"]).allowed_delegate_roles:
+                raise RuntimeError("현재 원문이 허용하지 않은 상담의 재전송을 중단했습니다.")
+            result = finished.get(record["consultation_id"])
+            if result is None:
+                candidate = next(((request, reply) for request, reply in reversed(saved)
+                    if request.role_id.value == record["to_role"] and any(
+                        item.get("kind") == "consultation_request"
+                        and item.get("consultation_id") == record["consultation_id"]
+                        for item in request.turn_messages)), None)
+                complete = candidate and not (candidate[1].calls or candidate[1].repository_tools)
+                waiting = complete and candidate[1].needs_user_input
+                stop = ("BUDGET_LIMIT" if candidate[1].metadata.get("budget_stop") else
+                        (candidate[0].context.repository_context or {}).get("agent_loop_stop_reason", "")) if candidate else ""
+                result = {**record, "status": "WAITING_USER" if waiting else "COMPLETED" if complete and not stop else "PARTIAL",
+                    "reason": "USER_QUESTION" if waiting else stop or ("" if complete else "INTERRUPTED"),
+                    "text": candidate[1].text + ("\n" + "\n".join(waiting) if waiting else "")
+                            if complete else "중단 시점의 상담 응답은 미확인입니다."}
+                if candidate:
+                    context = candidate[0].context
+                    result["evidence_refs"] = list(dict.fromkeys(record["evidence_refs"] + [
+                        item.get("data", {}).get("source_ref") or item.get("data", {}).get("evidence_key", "")
+                        for item in context.evidence]))
+                    result["untrusted_repository_data"] = bool(record.get("untrusted_repository_data") or context.evidence)
+                    result.update(self._repository_reply_marker(context, candidate[0].turn_messages))
+                with self.store.transaction():
+                    self.context.add_message(state.run_id, record["to_role"], result["text"],
+                        kind="consultation_result", data={**result, "external_message_id": message.external_message_id})
+                    self.logger.emit(state.run_id, "AGENT_CONSULTATION_FINISHED",
+                        "저장된 상담 결과와 종료 사유를 복구했습니다.", role_id=record["to_role"],
+                        status=result["status"], data=result)
+            results.append(result)
+        request, reply = saved[-1] if saved else (None, None)
+        final = bool(request and request.role_id.value == binding["active_role"]
+                     and request.caller_role is None
+                     and request.call_purpose in {"consultation_return", "consultation_final", "agent_loop_final"}
+                     and not reply.calls and not reply.repository_tools)
+        reason = next((item["reason"] for item in results if item["status"] != "COMPLETED"), "")
+        if final:
+            text = reply.text + ("\n" + "\n".join(reply.needs_user_input) if reply.needs_user_input else "")
+            reason = reason or ("BUDGET_LIMIT" if reply.metadata.get("budget_stop") else
+                                (request.context.repository_context or {}).get("agent_loop_stop_reason", ""))
+            if reason and not reply.needs_user_input:
+                text += f"\n추가 상담을 중단했습니다 ({reason})."
+        else:
+            reason = reason or "INTERRUPTED"
+            text = "상담을 부분 종료했습니다 (INTERRUPTED). 확보한 결과와 미확인 항목을 정리합니다.\n" + "\n".join(
+                f"{self.role_names.get(item['to_role'], item['to_role'])}: {item['status']} "
+                f"({item.get('reason') or '응답 확보'})\n{item.get('text', '')[:1200]}" for item in results)
+        self._check_cancelled(cancelled)
+        untrusted = any(item.get("untrusted_repository_data") for item in results)
+        marker = self._repository_reply_marker(request.context, tuple(results)) if request else {}
+        calls = self.store.model_calls_for_request(self.team_backend.request_key(message))
+        result = RequestResult(RequestOutcome.WAITING_USER if final and reply.needs_user_input
+            else RequestOutcome.PARTIAL if reason else RequestOutcome.SUCCESS,
+            "USER_QUESTION" if final and reply.needs_user_input else reason,
+            len(calls), sum(item["status"] == "COMPLETED" for item in calls))
+        with self.store.transaction():
+            # 중간 응답이 남은 재개도 한 번의 확정 응답으로 원자적으로 교체한다.
+            output = self._out(message, text, binding, state, role_id=binding["active_role"],
+                untrusted_repository_data=untrusted, repository_marker=marker if untrusted else None,
+                result=result)
+            self.store.save_conversation_result(message.channel, message.conversation_id,
+                                                message.external_message_id, result)
+        return ConversationResult((output,), result)
 
     def _start_conversation_progress(
         self,
@@ -3120,6 +3776,7 @@ class DialogueRouter:
         active_step: int,
         detail: str,
         outcome: str = "running",
+        force_terminal: bool = False,
     ) -> None:
         if progress is None or self.progress_notifier is None:
             return
@@ -3134,7 +3791,11 @@ class DialogueRouter:
         )
         with self._progress_lock:
             current = self._active_progress.get(key)
-            if current is not None and current.progress.outbound_id != progress.outbound_id:
+            if current is None or current.progress.outbound_id != progress.outbound_id:
+                return
+            if current.outcome != "running" and not force_terminal:
+                return
+            if current.outcome == "cancelled" and outcome != "cancelled":
                 return
             text = self._render_conversation_progress(
                 progress,
@@ -3180,16 +3841,8 @@ class DialogueRouter:
         detail: str,
         outcome: str,
     ) -> str:
-        if outcome not in {"running", "completed", "attention", "cancelled"}:
-            raise ValueError("unsupported conversation progress outcome")
-        completed_steps = max(0, min(4, completed_steps))
         active_step = max(1, min(4, active_step))
-        header_state = {
-            "running": "진행 중",
-            "completed": "완료",
-            "attention": "확인 필요",
-            "cancelled": "취소됨",
-        }[outcome]
+        header_state = "진행 중" if outcome == "running" else RequestOutcome(outcome).label
         stage_names = (
             "요청 분석",
             "프로젝트 확인",
@@ -3197,17 +3850,8 @@ class DialogueRouter:
             "최종 답변 정리",
         )
         lines = [f"[{progress.title} · {header_state}]", ""]
-        for index, name in enumerate(stage_names, start=1):
-            if index == 2 and not progress.repository_required:
-                marker = "➖"
-                name = f"{name} · 이번 요청은 생략"
-            elif outcome == "completed" or index <= completed_steps:
-                marker = "✅"
-            elif index == active_step:
-                marker = "⚠️" if outcome == "attention" else ("⏹️" if outcome == "cancelled" else "🔄")
-            else:
-                marker = "⬜"
-            lines.append(f"{marker} {index}/4 {name}")
+        if outcome == "running":
+            lines.append(f"현재 작업: {stage_names[active_step - 1]}")
         elapsed_seconds = max(0, int(time.monotonic() - progress.started_at))
         minutes, seconds = divmod(elapsed_seconds, 60)
         last_progress = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -3215,7 +3859,7 @@ class DialogueRouter:
             (
                 "",
                 detail.strip()[:500],
-                f"진행: {completed_steps}/4 · 경과: {minutes:02d}:{seconds:02d}",
+                f"경과: {minutes:02d}:{seconds:02d}",
                 f"마지막 진행: {last_progress}",
             )
         )
@@ -3230,13 +3874,14 @@ class DialogueRouter:
         repository_context: dict,
     ) -> AgentCallRequest | None:
         """Allow a bounded consultation without relaying repository instructions."""
-        if not repository_context.get("untrusted_repository_data", False):
-            return call
-        if not self._user_authorized_repository_consultation(message):
+        intent = message.metadata.get("user_intent")
+        if intent is None:
+            intent = self.role_resolver.interpret(message.text, role_id).to_dict()
+        if call.to_role.value not in intent.get("allowed_delegate_roles", []):
             self.logger.emit(
                 state.run_id,
-                "REPOSITORY_CONTEXT_CALL_BLOCKED",
-                "사용자가 요청하지 않은 저장소 문맥의 역할 호출을 차단했습니다.",
+                "REPOSITORY_CONTEXT_CALL_BLOCKED" if repository_context.get("untrusted_repository_data") else "AGENT_CONSULTATION_BLOCKED",
+                "사용자가 요청하지 않은 대상의 상담 호출을 차단했습니다.",
                 role_id=role_id.value,
                 status="COMPLETED",
                 data={
@@ -3246,6 +3891,8 @@ class DialogueRouter:
                 },
             )
             return None
+        if not repository_context.get("untrusted_repository_data", False):
+            return call
         if _REPOSITORY_CALL_BLOCKLIST.search(call.purpose):
             self.logger.emit(
                 state.run_id,
@@ -3277,7 +3924,7 @@ class DialogueRouter:
     @staticmethod
     def _user_authorized_repository_consultation(message: IncomingMessage) -> bool:
         """Only a current user request, never repository text, may authorize a call."""
-        return bool(_REPOSITORY_USER_COLLABORATION_REQUEST.search(message.text))
+        return bool(RoleResolver().interpret(message.text, RoleId.DEVELOPMENT).allowed_delegate_roles)
 
     def _current_agent_state(
         self, message: IncomingMessage, expected: RunState
@@ -3365,6 +4012,21 @@ class DialogueRouter:
         repository_identity = (
             selected.repository_identity.strip() if selected is not None else ""
         )
+        source_messages = None
+        session = self.store.load_conversation_session(
+            message.channel, message.conversation_id
+        )
+        if (session is not None and session.user_id == message.user_id
+                and session.active_task_id == state.run_id
+                and session.session_run_id != state.run_id):
+            # 하위 결과는 부모 세션에 저장되지만 후속 대화는 작업 run에서 실행된다.
+            parent_results = [item for item in self._scoped_session_messages(
+                session.session_run_id, repository_identity
+            ) if item["kind"] in {"analysis_result", "pipeline_result"}]
+            source_messages = sorted(
+                [*self.store.list_messages(state.run_id), *parent_results],
+                key=lambda item: item["timestamp"],
+            )
         return self.context.build(
             state.run_id,
             conversation_key=self._conversation_memory_key(
@@ -3377,8 +4039,10 @@ class DialogueRouter:
                 or (selected.repository_path if selected else state.repository)
             ),
             repository_identity=repository_identity,
+            repository_head_sha=selected.head_sha if selected else "",
             repository_context=repository_context,
-            exclude_untrusted_repository_messages=not bool(repository_context),
+            source_messages=source_messages,
+            exclude_untrusted_repository_messages=False,
         )
 
     def _repository_context_for_chat(
@@ -3389,7 +4053,7 @@ class DialogueRouter:
         *,
         cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict, str]:
-        if self.repository_reader is None or not self.repository_reader.should_inspect(
+        if forbids_repository_reads(message.text) or self.repository_reader is None or not self.repository_reader.should_inspect(
             message.text
         ):
             return {}, ""
@@ -3448,7 +4112,12 @@ class DialogueRouter:
                 status="NEEDS_ATTENTION",
                 data={"error_type": type(exc).__name__, "error": str(exc)[:300]},
             )
-            return {}, "프로젝트 내용을 안전하게 읽지 못했습니다. 로그에 원인을 남겼습니다."
+            return {"request_result": RequestResult(RequestOutcome.FAILED, "REPOSITORY_READ_FAILED").to_dict()}, "프로젝트 내용을 안전하게 읽지 못했습니다. 로그에 원인을 남겼습니다."
+        if snapshot.head_sha != selected.head_sha:
+            self.store.refresh_project_head(
+                message.channel, message.conversation_id, message.user_id,
+                snapshot.identity_hash, snapshot.head_sha,
+            )
         self.logger.emit(
             state.run_id,
             "PROJECT_SNAPSHOT_READ",
@@ -3463,7 +4132,9 @@ class DialogueRouter:
                 "truncated": snapshot.truncated,
             },
         )
-        return snapshot.to_dict(), ""
+        result = snapshot.to_dict()
+        self._record_repository_evidence(message, state, result)
+        return result, ""
 
     def _repository_tool_context_for_chat(
         self,
@@ -3476,6 +4147,8 @@ class DialogueRouter:
         tool_round: int,
         cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict, str]:
+        if forbids_repository_reads(message.text):
+            return {}, "현재 요청의 읽기 금지에 따라 상세 저장소 조회를 진행하지 않았습니다."
         if self.repository_tools is None or not repository_context:
             self.logger.emit(
                 state.run_id,
@@ -3570,19 +4243,121 @@ class DialogueRouter:
                 "truncated": batch.truncated,
             },
         )
-        return {
-            "source": "approved_committed_git_snapshot",
-            "untrusted_repository_data": True,
+        result = {
+            **repository_context,
             "identity_hash": batch.identity_hash,
             "head_sha": batch.head_sha,
-            "branch": repository_context.get("branch", ""),
-            "tree": list(repository_context.get("tree", [])),
-            "documents": [],
             "tool_round": tool_round,
-            "tool_results": [batch.to_dict()],
-            "truncated": bool(repository_context.get("truncated"))
-            or batch.truncated,
-        }, ""
+            "tool_results": [*repository_context.get("tool_results", []), batch.to_dict()],
+            "truncated": bool(repository_context.get("truncated")) or batch.truncated,
+        }
+        self._record_repository_evidence(message, state, batch.to_dict())
+        return self._bound_repository_context(result), ""
+
+    def _record_repository_evidence(
+        self, message: IncomingMessage, state: RunState, source: dict
+    ) -> None:
+        identity = str(source.get("identity_hash", ""))
+        head = str(source.get("head_sha", ""))
+        for document in source.get("documents", []):
+            path = str(document.get("path", ""))
+            content = str(document.get("content", ""))
+            if not path or not content:
+                continue
+            end = max(1, len(content.splitlines()))
+            key = f"{message.external_message_id}:{head}:document:{path}:1:{end}"
+            self.context.add_repository_evidence(
+                state.run_id, key=key, content=content,
+                data={"repository_identity": identity, "head_sha": head,
+                      "path": path, "start_line": 1, "end_line": end,
+                      "source_ref": key},
+            )
+        for result in source.get("results", []):
+            request = result.get("request", {})
+            if result.get("status") != "ok":
+                continue
+            data = result.get("data", {})
+            if request.get("tool") == "read_file":
+                entries = [(str(data.get("path", "")),
+                            int(data.get("start_line", 0)),
+                            int(data.get("end_line", 0)),
+                            str(data.get("content", "")))]
+            else:
+                entries = [(str(item.get("path", "")), int(item.get("line", 0)),
+                            int(item.get("line", 0)), str(item.get("excerpt", "")))
+                           for item in data.get("matches", [])]
+            for path, start, end, content in entries:
+                if not path or start < 1 or end < start or not content:
+                    continue
+                key = f"{message.external_message_id}:{head}:tool:{path}:{start}:{end}"
+                self.context.add_repository_evidence(
+                    state.run_id, key=key, content=content,
+                    data={"repository_identity": identity, "head_sha": head,
+                          "path": path, "start_line": start, "end_line": end,
+                          "source_ref": key},
+                )
+
+    def _bound_repository_context(self, context: dict) -> dict:
+        """Keep previous references while fitting the model's context limit."""
+        limit = max(1000, self.context.policy.max_characters - 4000)
+        size = lambda: len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+        if size() <= limit:
+            return context
+        context["truncated"] = True
+        for document in context.get("documents", []):
+            if size() <= limit:
+                break
+            document["content"] = str(document.get("content", ""))[:1600]
+            document["excerpt_only"] = True
+        for batch in context.get("tool_results", []):
+            for result in batch.get("results", []):
+                if size() <= limit:
+                    break
+                data = result.get("data", {})
+                if "content" in data:
+                    data["content"] = str(data["content"])[:1600]
+                    data["excerpt_only"] = True
+                if "matches" in data:
+                    data["matches"] = list(data["matches"])[:3]
+                    data["excerpt_only"] = True
+        while context.get("tree") and size() > limit:
+            context["tree"].pop()
+        if size() > limit:
+            for document in context.get("documents", []):
+                document["content"] = str(document.get("content", ""))[:240]
+                document["excerpt_only"] = True
+            for batch in context.get("tool_results", []):
+                for result in batch.get("results", []):
+                    data = result.get("data", {})
+                    if "content" in data:
+                        data["content"] = str(data["content"])[:240]
+                        data["excerpt_only"] = True
+                    if "matches" in data:
+                        data["matches"] = list(data["matches"])[:1]
+                        data["excerpt_only"] = True
+        if size() > limit:
+            context["documents"] = [
+                {"path": item.get("path", ""), "reference_only": True}
+                for item in context.get("documents", [])
+            ]
+            context["tool_results"] = [
+                {"head_sha": batch.get("head_sha", ""),
+                 "results": [
+                     {"request": result.get("request", {}), "status": "reference_only",
+                      "data": {key: result.get("data", {}).get(key)
+                               for key in ("path", "start_line", "end_line")
+                               if key in result.get("data", {})}}
+                     for result in batch.get("results", [])
+                 ]}
+                for batch in context.get("tool_results", [])
+            ]
+        if size() > limit:
+            context["exclusions"] = {}
+            while size() > limit and len(context.get("documents", [])) > 2:
+                context["documents"].pop(0)
+            while size() > limit and len(context.get("tool_results", [])) > 2:
+                context["tool_results"].pop(0)
+        return context
 
     def _save_memory_updates(
         self,
@@ -3645,22 +4420,18 @@ class DialogueRouter:
         purpose: str,
         *,
         untrusted_repository_data: bool = False,
+        repository_marker: dict | None = None,
     ) -> OutgoingMessage:
         source = self.role_names.get(from_role.value, from_role.value)
         target = self.role_names.get(to_role.value, to_role.value)
-        self.logger.emit(
-            state.run_id,
-            "AGENT_CONSULTATION_REQUESTED",
-            "자유 대화에서 다른 에이전트를 호출했습니다.",
-            role_id=from_role.value,
-            data={"from_role": from_role.value, "to_role": to_role.value, "purpose": purpose},
-        )
         return self._out(
             incoming,
             f"[{source} → {target}]\n{purpose}",
             binding,
             state,
             untrusted_repository_data=untrusted_repository_data,
+            repository_marker=repository_marker,
+            message_kind="consultation_progress",
         )
 
     def _record_inbound(
@@ -3765,6 +4536,9 @@ class DialogueRouter:
         *,
         role_id: str = "",
         untrusted_repository_data: bool = False,
+        repository_marker: dict | None = None,
+        result: RequestResult | None = None,
+        message_kind: str = "assistant_message",
     ) -> OutgoingMessage:
         rendered = text
         if role_id:
@@ -3776,7 +4550,7 @@ class DialogueRouter:
                 current.run_id,
                 role_id or "system",
                 rendered,
-                kind="assistant_message",
+                kind=message_kind,
                 data={
                     "channel": incoming.channel,
                     "conversation_id": incoming.conversation_id,
@@ -3787,6 +4561,8 @@ class DialogueRouter:
                         else {}
                     ),
                     **self._repository_context_marker(incoming),
+                    **(repository_marker or {}),
+                    **({"request_result": result.to_dict()} if result else {}),
                 },
             )
             self.logger.emit(
@@ -3801,7 +4577,27 @@ class DialogueRouter:
             conversation_id=incoming.conversation_id,
             text=rendered,
             reply_to=incoming.external_message_id,
+            metadata={"request_result": result.to_dict()} if result else {},
         )
+
+    @staticmethod
+    def _repository_reply_marker(context, turn_messages: tuple[dict, ...]) -> dict:
+        """Attribute an answer to the snapshots actually supplied to the model."""
+        sources = [item.get("data", {}) for item in (
+            *context.evidence, *context.recent_messages
+        ) if item.get("data", {}).get("untrusted_repository_data")]
+        sources.extend(item for item in turn_messages
+                       if item.get("untrusted_repository_data"))
+        repository = context.repository_context or {}
+        if repository.get("untrusted_repository_data"):
+            sources.append(repository)
+        heads = sorted({
+            head for source in sources
+            for head in (source.get("repository_source_heads")
+                         or [source.get("head_sha", "")]) if head
+        })
+        return {"repository_source_heads": heads,
+                "head_sha": heads[0] if len(heads) == 1 else ""}
 
     def _repository_context_marker(
         self, message: IncomingMessage
@@ -3812,7 +4608,8 @@ class DialogueRouter:
         if selected is None or selected.user_id != message.user_id:
             return {}
         identity = selected.repository_identity.strip()
-        return {"repository_identity": identity} if identity else {}
+        return ({"repository_identity": identity, "head_sha": selected.head_sha}
+                if identity else {})
 
     @staticmethod
     def _conversation_memory_key(
@@ -3889,6 +4686,8 @@ class DialogueRouter:
                 "토큰",
                 "토큰 사용량",
                 "토큰 상태",
+                "어디까지 했어?", "어디까지 했어", "어디까지 진행했어?", "어디까지 진행했어",
+                "진행 상황 알려줄래?", "지금 뭐 하고 있어?", "지금 어디까지 했어?",
             }
         )
 
@@ -3913,6 +4712,7 @@ class DialogueRouter:
                 "중단해줘",
                 "그만해",
                 "그만해줘",
+                "취소", "작업 취소", "취소해", "취소해줘",
             }
         )
 
@@ -3928,6 +4728,7 @@ class DialogueRouter:
                 "이어가줘",
                 "계속 진행",
                 "계속 진행해",
+                "이어서 해", "이어서 해줘",
             }
         )
 
@@ -3948,7 +4749,11 @@ class DialogueRouter:
             | cls.new_controls()
             | cls.stop_controls()
             | cls.resume_controls()
-        ) or cls.is_memory_control(message) or control in {"분석 결과", "분석 결과 조회"}
+        ) or cls.is_memory_control(message) or cls.is_budget_control(message) or control in {"분석 결과", "분석 결과 조회"}
+
+    @staticmethod
+    def is_budget_control(message: IncomingMessage) -> bool:
+        return message.text.strip().lower().split()[0] in {'/budget_reset', '/budget_ack'} if message.text.strip() else False
 
     @classmethod
     def is_stop_control(cls, message: IncomingMessage) -> bool:
@@ -3960,18 +4765,7 @@ class DialogueRouter:
 
     @staticmethod
     def _is_work_intent(text: str) -> bool:
-        normalized = re.sub(r"\s+", " ", text.strip().lower())
-        if re.search(r"^(?:왜|무엇|뭐|어떻게|언제|어떤)\b|(?:해도\s*되는지|할지\s*판단|라고\s*말하면|라는\s*말|이란|란\s*뭐)", normalized):
-            return False
-        if re.search(r"(?:하지\s*마|말아|하지\s*않|안\s*해)", normalized):
-            return False
-        if normalized.endswith("개발") or "작업으로 진행" in normalized:
-            return True
-        return bool(re.search(
-            r"(?:개발|구현|수정|고쳐|추가|만들|설계|작성|잡아|바꿔|적용)"
-            r"\s*(?:해|해줘|해주세요|해\s*줘|하자|하고\s*싶어|하고\s*싶어요|해\s*보고\s*싶어)",
-            normalized,
-        ) or re.search(r"(?:고쳐|만들어|잡아|바꿔)\s*(?:줘|주세요|주라|보자)?$", normalized))
+        return is_work_request(text)
 
     @staticmethod
     def _is_plan_revision_request(text: str) -> bool:

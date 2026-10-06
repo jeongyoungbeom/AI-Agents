@@ -122,7 +122,8 @@ class PipelineGatewayIntegrationTests(unittest.TestCase):
             self.assertEqual(RunPhase.DEVELOPING, current.phase)
             self.assertEqual("QUEUED", scheduler.jobs[paused.run_id])
             self.assertIsNone(question)
-            self.assertIn("다시 실행 큐", answered[0].text)
+            self.assertIn("보존된 작업 공간", answered[0].text)
+            self.assertIn("QUEUED", answered[0].text)
             decisions = [item["content"] for item in store.list_messages(paused.run_id)]
             self.assertIn("실행 중 사용자 답변: PostgreSQL로 진행해줘", decisions)
 

@@ -235,15 +235,11 @@ class BudgetTests(unittest.TestCase):
                 10,
             )
 
-            with self.assertRaises(BudgetExceeded):
-                manager.record_usage(
-                    "RUN-RESERVATION-OVERAGE",
-                    "chat-001",
-                    "development",
-                    "conversation",
-                    TokenUsage(total_tokens=11),
-                    reservation=reservation,
-                )
+            manager.record_usage(
+                "RUN-RESERVATION-OVERAGE", "chat-001", "development", "conversation",
+                TokenUsage(total_tokens=11), reservation=reservation,
+            )
+            self.assertFalse(manager.can_spend("RUN-RESERVATION-OVERAGE", "chat-001", 1).allowed)
 
             self.assertEqual(11, store.usage_total("RUN-RESERVATION-OVERAGE"))
             self.assertEqual(

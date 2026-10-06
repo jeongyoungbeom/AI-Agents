@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import base64
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +130,17 @@ class GitRepository:
             raise GitRepositoryError("격리 worktree checkout revision이 올바르지 않습니다.")
         self._run("checkout", "--detach", "--force", "--no-progress", revision)
 
+    def retain_candidate(self, run_id: str, revision: str) -> None:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', run_id):
+            raise GitRepositoryError('candidate run ID가 올바르지 않습니다.')
+        if not re.fullmatch(r'[0-9a-f]{40}', revision):
+            raise GitRepositoryError('candidate SHA가 올바르지 않습니다.')
+        self._run('update-ref', f'refs/ai-agents/{run_id}/candidate', revision)
+
+    def matches_pending_commit(self, before: str, candidate: str, message: str) -> bool:
+        return (self._git('rev-list', '--parents', '-n', '1', candidate) == f'{candidate} {before}'
+                and self._git('show', '-s', '--format=%s', candidate) == message)
+
     def assert_position(self, before: GitSnapshot, *, allow_worktree_changes: bool) -> GitSnapshot:
         after = self.snapshot()
         if after.head != before.head or after.branch != before.branch:
@@ -235,6 +248,23 @@ class GitRepository:
             return "(변경 없음)"
         return self._git("diff", "--stat", f"{base_sha}..{candidate_sha}", allow_empty=True)
 
+    def review_bundle(self, base_sha: str, candidate_sha: str) -> dict:
+        if any(not re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (base_sha, candidate_sha)):
+            raise GitRepositoryError('리뷰 revision이 유효한 SHA가 아닙니다.')
+        baseline = self.snapshot()
+        if baseline.head != candidate_sha or baseline.status:
+            raise GitRepositoryError('리뷰 candidate와 현재 작업 공간이 일치하지 않습니다.')
+        patch_bytes = self._run('diff', '--binary', '--no-ext-diff', '--no-textconv',
+                                f'{base_sha}..{candidate_sha}', binary_output=True).stdout
+        self.assert_position(baseline, allow_worktree_changes=False)
+        import hashlib
+        return {'base_sha': base_sha, 'candidate_sha': candidate_sha,
+                'patch': patch_bytes.decode('utf-8', errors='replace'),
+                'patch_base64': base64.b64encode(patch_bytes).decode('ascii'),
+                'patch_sha256': hashlib.sha256(patch_bytes).hexdigest(),
+                'changed_files': list(self.changed_files(base_sha, candidate_sha)),
+                'untrusted_repository_data': True}
+
     def assert_safe_worktree_paths(self) -> None:
         """Reject symlinks that could take a writable role outside its checkout."""
         root = self.path.resolve(strict=True)
@@ -289,8 +319,8 @@ class GitRepository:
         """Apply a verified linear candidate only to an unchanged clean source.
 
         The source checkout must still be exactly the snapshot from which the
-        isolated worktree started.  With that invariant, cherry-picking the
-        linear range cannot overlap a user change.  Any failed command leaves
+        isolated worktree started. With that invariant, fast-forwarding the
+        verified range preserves its exact SHA for crash recovery. A failed command leaves
         Git's evidence in place instead of attempting an unsafe rollback.
         """
         current = self.snapshot()
@@ -298,17 +328,19 @@ class GitRepository:
             raise GitRepositoryError(
                 "원본 저장소의 HEAD, 브랜치 또는 작업 트리가 실행 중 바뀌어 자동 반영하지 않았습니다."
             )
-        changed = self.assert_commit_scope(base.head, candidate_sha, scope)
-        if not changed:
+        self.assert_commit_scope(base.head, candidate_sha, scope)
+        if base.head == candidate_sha:
             return current.head
         self._run(
             "-c",
             "commit.gpgSign=false",
-            "cherry-pick",
-            f"{base.head}..{candidate_sha}",
+            "merge",
+            "--ff-only",
+            "--no-edit",
+            candidate_sha,
         )
         applied = self.snapshot()
-        if applied.status:
+        if applied.head != candidate_sha or applied.branch != base.branch or applied.status:
             raise GitRepositoryError(
                 "원본 반영 뒤 확인되지 않은 작업 트리 변경이 남아 자동 처리를 중단했습니다."
             )
@@ -335,7 +367,7 @@ class GitRepository:
             raise GitRepositoryError(f"Git 결과가 비어 있습니다: {' '.join(arguments)}")
         return output
 
-    def _run(self, *arguments: str):
+    def _run(self, *arguments: str, binary_output: bool = False):
         git_prefix = ["git"]
         if self.git_metadata is not None:
             git_prefix.extend(
@@ -344,33 +376,27 @@ class GitRepository:
                     "--work-tree=/workspace",
                 )
             )
+        command = [*git_prefix, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                   '-c', 'core.useBuiltinFSMonitor=false', '-c', 'core.pager=cat',
+                   '-c', f"core.autocrlf={'true' if os.name == 'nt' else 'false'}", *arguments]
+        if binary_output:
+            # Keep CRLF, trailing whitespace and non-UTF8 bytes across the
+            # Docker CLI's text transport. Only fixed Git argv reaches this bridge.
+            command = ['python3', '-c',
+                'import base64,subprocess,sys; r=subprocess.run(sys.argv[1:],stdout=subprocess.PIPE,stderr=subprocess.PIPE); '
+                'sys.stdout.buffer.write(base64.b64encode(r.stdout)); sys.stderr.buffer.write(r.stderr); sys.exit(r.returncode)',
+                *command]
         try:
             result = self.sandbox.run(
                 self.path,
-                [
-                    *git_prefix,
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.useBuiltinFSMonitor=false",
-                    "-c",
-                    "core.pager=cat",
-                    "-c",
-                    # The gateway runs on Windows while the isolated Git runs
-                    # on Linux.  Match Git for Windows' checkout conversion so
-                    # a clean CRLF worktree is not reported as modified.
-                    f"core.autocrlf={'true' if os.name == 'nt' else 'false'}",
-                    *arguments,
-                ],
-                writable_workspace=True,
+                command,
+                writable_workspace=not binary_output,
                 timeout=120,
                 cancelled=self.cancelled,
                 operation_id=self.operation_id,
                 component=self.component,
                 git_metadata=self.git_metadata,
-                writable_git_metadata=self.git_metadata is not None,
+                writable_git_metadata=self.git_metadata is not None and not binary_output,
             )
         except DockerSandboxCancelled as exc:
             raise GitRepositoryCancelled("사용자가 Git 작업을 중지했습니다.") from exc
@@ -381,4 +407,7 @@ class GitRepository:
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise GitRepositoryError(f"Git 명령 실패: {detail[:1200]}")
+        if binary_output:
+            return subprocess.CompletedProcess(result.args, result.returncode,
+                base64.b64decode(result.stdout.strip(), validate=True), result.stderr)
         return result

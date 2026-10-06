@@ -31,6 +31,14 @@ _RISK_NAMES = frozenset(
 _BINARY_SUFFIXES = frozenset({".bin", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".jar", ".exe", ".dll", ".so", ".pyc", ".db"})
 
 
+def analysis_batch_for_file(item: dict, *, start_line: int = 1) -> dict:
+    phase = {"foundation": "STRUCTURE", "configuration": "STRUCTURE",
+             "documentation": "STRUCTURE", "tests": "TESTS", "source": "CORE"}.get(item["category"], "RISKS")
+    return {"phase": phase, "paths": [item["path"]],
+            "categories": [item["category"]], "estimated_bytes": item["size"],
+            "start_lines": {item["path"]: start_line}}
+
+
 def classify_analysis_path(entry: RepositorySnapshotEntry) -> str:
     path = PurePosixPath(entry.path)
     parts = {part.casefold() for part in path.parts[:-1]}
@@ -61,9 +69,10 @@ def build_repository_analysis_plan(
     max_context_bytes: int | None = None,
     adaptive_file_limit: int = 48,
     mode: str | None = None,
+    max_scan_bytes: int = 4 * 1024 * 1024,
 ) -> dict:
     """Produce a deterministic, purpose-weighted plan without reading file content."""
-    limits = (max_files_per_batch, max_file_bytes, max_batch_bytes, adaptive_file_limit)
+    limits = (max_files_per_batch, max_file_bytes, max_batch_bytes, adaptive_file_limit, max_scan_bytes)
     if any(limit < 1 for limit in limits) or (max_context_bytes is not None and max_context_bytes < 1):
         raise ValueError("repository analysis plan limits must be positive")
     mode = mode or ("full" if is_full_repository_audit_request(request_text) else "adaptive")
@@ -77,14 +86,10 @@ def build_repository_analysis_plan(
     for entry in manifest.entries:
         category = classify_analysis_path(entry)
         reason = ""
-        if mode == "full" and PurePosixPath(entry.path).suffix.casefold() in _BINARY_SUFFIXES:
+        if PurePosixPath(entry.path).suffix.casefold() in _BINARY_SUFFIXES:
             reason = "binary_extension"
-        elif entry.size > max_file_bytes:
-            reason = "file_size_limit"
-        elif max_context_bytes is not None and entry.size > max_context_bytes:
-            reason = "context_size_limit"
-        elif entry.size > max_batch_bytes:
-            reason = "batch_size_limit"
+        elif entry.size > max_scan_bytes:
+            reason = "scan_size_limit"
         targets.append(
             {
                 "path": entry.path,
@@ -108,6 +113,7 @@ def build_repository_analysis_plan(
         candidates.sort(
             key=lambda item: (
                 -sum(token in item["path"].casefold() for token in tokens),
+                PurePosixPath(item["path"]).stem.casefold() not in {"main", "app", "server", "index", "cli", "__main__"},
                 len(item["path"]),
                 item["path"].casefold(),
             )
@@ -133,13 +139,19 @@ def build_repository_analysis_plan(
         if not item["selected"]
     ]
 
+    entrypoints = [item for item in selected["source"] if PurePosixPath(item["path"]).stem.casefold()
+                  in {"main", "app", "server", "index", "cli", "__main__"}]
+    if not entrypoints:
+        entrypoints = selected["source"][:max_files_per_batch]
+    entrypoint_paths = {item["path"] for item in entrypoints}
     phase_specs = (
         (
             RepositoryAnalysisPhase.STRUCTURE,
             selected["foundation"] + selected["configuration"] + selected["documentation"],
         ),
+        (RepositoryAnalysisPhase.CORE, entrypoints),
         (RepositoryAnalysisPhase.TESTS, selected["tests"]),
-        (RepositoryAnalysisPhase.CORE, selected["source"]),
+        (RepositoryAnalysisPhase.CORE, [item for item in selected["source"] if item["path"] not in entrypoint_paths]),
         (RepositoryAnalysisPhase.RISKS, selected["risk"] + selected.get("other", [])),
     )
     batches: list[dict] = []
@@ -159,10 +171,11 @@ def build_repository_analysis_plan(
         chunk: list[dict] = []
         total_bytes = 0
         for item in items:
-            size = int(item["size"])
+            size = min(int(item["size"]), max_file_bytes, max_batch_bytes,
+                       max_context_bytes or max_batch_bytes)
             if chunk and (
                 len(chunk) >= max_files_per_batch
-                or total_bytes + size > max_batch_bytes
+                or total_bytes + size > min(max_batch_bytes, max_context_bytes or max_batch_bytes)
             ):
                 append_batch(phase, chunk, total_bytes)
                 chunk = []
@@ -187,12 +200,8 @@ def build_repository_analysis_plan(
             reason = str(item["exclude_reason"])
             excluded[reason] = excluded.get(reason, 0) + 1
     partial_reasons = []
-    if excluded.get("context_size_limit", 0):
-        partial_reasons.append("CONTEXT_LIMIT")
-    if excluded.get("file_size_limit", 0):
-        partial_reasons.append("FILE_SIZE_LIMIT")
-    if excluded.get("batch_size_limit", 0):
-        partial_reasons.append("BATCH_SIZE_LIMIT")
+    if excluded.get("scan_size_limit", 0):
+        partial_reasons.append("SCAN_SIZE_LIMIT")
     if any(item["reason"] == "selection_limit" for item in not_selected):
         partial_reasons.append("SELECTION_LIMIT")
     if any(item["reason"] == "category_not_selected" for item in not_selected):
@@ -207,5 +216,7 @@ def build_repository_analysis_plan(
         "partial_reasons": partial_reasons,
         "excluded": dict(sorted(excluded.items())),
         "mode": mode,
+        "working_tree_dirty": manifest.working_tree_dirty,
+        "open_questions": [],
     }
 

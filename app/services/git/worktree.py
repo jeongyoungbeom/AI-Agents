@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,7 @@ class IsolatedGitWorktree:
         *,
         run_id: str,
         cancelled=None,
+        record: dict | None = None,
     ) -> None:
         if not _RUN_ID.fullmatch(run_id):
             raise ValueError("run_id is invalid for an isolated worktree")
@@ -76,11 +78,68 @@ class IsolatedGitWorktree:
             cancelled=cancelled,
         )
         self.run_id = run_id
-        self._root = Path(tempfile.mkdtemp(prefix=f"ai-agents-worktree-{run_id}-"))
+        prefix = f"ai-agents-worktree-{run_id}-"
+        if record is None:
+            self._root = Path(tempfile.mkdtemp(prefix=prefix))
+        else:
+            root = Path(record['temp_root'])
+            path = Path(record['worktree_path'])
+            if (root.is_symlink() or path.is_symlink()
+                    or root.parent.resolve() != Path(tempfile.gettempdir()).resolve()
+                    or not root.name.startswith(prefix)
+                    or path != root / 'worktree'
+                    or Path(record['source_path']).resolve() != source_path):
+                raise GitWorktreeError('저장된 작업 공간의 소유 경로가 일치하지 않습니다.')
+            self._root = root
         self.path = self._root / "worktree"
         self._pointer_file = self._root / "container-gitdir"
         self.repository: GitRepository | None = None
         self.source_snapshot: GitSnapshot | None = None
+        self._guard = None
+        if record is not None:
+            saved = record['source_snapshot']
+            self.source_snapshot = GitSnapshot(
+                saved['head'], saved['branch'], saved['status'],
+                tuple(saved['untracked_files']),
+            )
+
+    def acquire_execution_guard(self) -> None:
+        """A process-held lock fences a live stale worker even after its SQLite lease expires."""
+        path = self._root / 'execution.lock'
+        if self._root.is_symlink() or path.is_symlink():
+            raise GitWorktreeError('작업 공간 실행 lock 경로가 안전하지 않습니다.')
+        self._root.mkdir(parents=True, exist_ok=True)
+        stream = path.open('a+b')
+        try:
+            if path.stat().st_size == 0:
+                stream.write(b'0')
+                stream.flush()
+            stream.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            stream.close()
+            raise GitWorktreeError('이전 worker가 작업 공간을 아직 사용 중입니다. 종료 후 재개해 주세요.') from exc
+        self._guard = stream
+
+    def release_execution_guard(self) -> None:
+        if self._guard is not None:
+            self._guard.close()
+            self._guard = None
+
+    def attach(self) -> GitRepository:
+        """Reopen the owned checkout without checkout/reset or dropping dirty files."""
+        metadata = self._linked_metadata()
+        self.repository = GitRepository(
+            self.path, self.source.sandbox, operation_id=self.run_id,
+            component='worktree-git', cancelled=self.source.cancelled,
+            git_metadata=metadata,
+        )
+        return self.repository
 
     def begin(self) -> tuple[GitRepository, GitSnapshot]:
         """Capture and validate the clean original before any worktree exists."""
@@ -92,11 +151,12 @@ class IsolatedGitWorktree:
         self.source_snapshot = validated
         return self.source, validated
 
-    def create(self, source_snapshot: GitSnapshot) -> GitRepository:
+    def create(self, source_snapshot: GitSnapshot, *, candidate_sha: str | None = None) -> GitRepository:
         if self.source_snapshot != source_snapshot:
             raise GitWorktreeError("원본 저장소 snapshot이 worktree 생성 전 변경되었습니다.")
         if self.repository is not None:
             return self.repository
+        revision = candidate_sha or source_snapshot.head
         self._run_lifecycle(
             "worktree",
             "add",
@@ -104,7 +164,7 @@ class IsolatedGitWorktree:
             "--detach",
             "--force",
             str(self.path),
-            source_snapshot.head,
+            revision,
         )
         try:
             metadata = self._linked_metadata()
@@ -116,11 +176,11 @@ class IsolatedGitWorktree:
                 cancelled=self.source.cancelled,
                 git_metadata=metadata,
             )
-            repository.checkout_detached(source_snapshot.head)
+            repository.checkout_detached(revision)
             isolated_snapshot = repository.preflight(
                 require_branch=False, check_path_escapes=True
             )
-            if isolated_snapshot.head != source_snapshot.head or isolated_snapshot.status:
+            if isolated_snapshot.head != revision or isolated_snapshot.status:
                 raise GitWorktreeError("생성한 임시 worktree의 시작 상태가 올바르지 않습니다.")
         except BaseException:
             # A partially created worktree is gateway-owned and has no model
@@ -196,6 +256,12 @@ class IsolatedGitWorktree:
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", parts[1])
         ):
             raise GitWorktreeError("생성한 worktree의 Git metadata 경로가 안전하지 않습니다.")
+        try:
+            back_pointer = (git_directory / 'gitdir').read_text(encoding='utf-8').strip()
+            if Path(back_pointer).resolve() != pointer.resolve():
+                raise GitWorktreeError('worktree metadata의 역참조가 저장된 경로와 다릅니다.')
+        except OSError as exc:
+            raise GitWorktreeError('worktree metadata의 역참조를 확인하지 못했습니다.') from exc
         self._pointer_file.write_text(
             f"gitdir: /ai-agents-gitdir/{relative}\n", encoding="utf-8"
         )
@@ -239,6 +305,16 @@ class IsolatedGitWorktree:
             )
 
     def _remove_empty_root(self) -> None:
+        if self._guard is not None:
+            return
+        if self.path.exists():
+            return
+        guard_path = self._root / 'execution.lock'
+        if guard_path.exists():
+            try:
+                guard_path.unlink()
+            except OSError:
+                return
         for path in (self._pointer_file,):
             try:
                 path.unlink(missing_ok=True)

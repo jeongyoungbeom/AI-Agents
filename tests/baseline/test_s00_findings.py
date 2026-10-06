@@ -34,18 +34,18 @@ class AuditReproductions(unittest.TestCase):
             self.assertFalse(any('신뢰성 실험' in x['content'] for x in context.recent_messages))
             print('CONFIRMED: followup loses the preceding project answer')
 
-    def test_named_delegation_is_not_authorized(self):
+    def test_named_delegation_is_authorized_after_s04(self):
         text='센티널아 테스트를 정리해줘. 니가 못할 것 같으면 빌더나 피니셔한테 말해도돼'
-        self.assertFalse(DialogueRouter._user_authorized_repository_consultation(incoming(1,text)))
+        self.assertTrue(DialogueRouter._user_authorized_repository_consultation(incoming(1,text)))
         self.assertTrue(DialogueRouter._user_authorized_repository_consultation(incoming(2,'다른 에이전트에게 의견을 물어봐')))
-        print('CONFIRMED: explicit Builder/Finisher delegation rejected by repository gate')
+        print('S04 REGRESSION: named conditional consultation is authorized')
 
-    def test_natural_requests_route_incorrectly(self):
-        self.assertTrue(DialogueRouter._is_work_intent('코드는 수정하지 말고 테스트 계획만 작성해줘'))
-        self.assertFalse(is_long_repository_analysis_request('전체 코드를 읽고 어떻게 테스트하면 좋을지 알려줘'))
-        print('CONFIRMED: no-edit planning becomes development intent; broad natural question misses long analysis')
+    def test_natural_requests_route_correctly_after_s04(self):
+        self.assertFalse(DialogueRouter._is_work_intent('코드는 수정하지 말고 테스트 계획만 작성해줘'))
+        self.assertTrue(is_long_repository_analysis_request('전체 코드를 읽고 어떻게 테스트하면 좋을지 알려줘'))
+        print('S04 REGRESSION: read-only planning stays in chat; broad reading retains its purpose question')
 
-    def test_error_notice_is_marked_completed(self):
+    def test_error_notice_is_marked_failed(self):
         class Team:
             def preflight(self,*args): pass
             def respond_as(self,*args,**kwargs): raise RuntimeError('fixture model failure')
@@ -54,18 +54,19 @@ class AuditReproductions(unittest.TestCase):
             app.router.set_progress_notifier(lambda:None)
             app.handle(incoming(1,'안녕'))
             records=store.deliverable_outbound('telegram')
-            self.assertTrue(any('완료]' in x['text'] and '4/4' in x['text'] for x in records))
+            self.assertTrue(any('· 실패]' in x['text'] for x in records))
+            self.assertFalse(any('4/4' in x['text'] for x in records))
             self.assertTrue(any('문제가 생겼습니다' in x['text'] for x in records))
-            print('CONFIRMED: failed response still produces completed 4/4 progress card')
+            print('REGRESSION: failed response produces a failed progress card')
 
-    def test_full_audit_omits_larger_files(self):
+    def test_full_audit_keeps_larger_files_after_s06(self):
         entries=(RepositorySnapshotEntry('app/core.py',12000),RepositorySnapshotEntry('app/small.py',100))
         cap=(24000-1024)//2
         plan=build_repository_analysis_plan(RepositorySnapshotManifest('a'*64,'b'*40,'main',entries),'전체 코드 분석해줘',max_files_per_batch=3,max_file_bytes=49152,max_batch_bytes=cap,max_context_bytes=cap)
         core=next(x for x in plan['files'] if x['path']=='app/core.py')
-        self.assertFalse(core['selected'])
-        self.assertEqual(core['exclude_reason'],'context_size_limit')
-        print(f'CONFIRMED: full audit excludes a 12000-byte core file (effective cap {cap})')
+        self.assertTrue(core['selected'])
+        self.assertEqual(core['exclude_reason'],'')
+        print(f'S06 REGRESSION: full audit retains a 12000-byte core file for ranged reads (chunk cap {cap})')
 
     def test_long_result_is_not_saved_to_conversation(self):
         with temporary_directory() as d:
@@ -81,10 +82,10 @@ class AuditReproductions(unittest.TestCase):
             store.finish_repository_analysis_with_response(req.analysis_id,'worker',RepositoryAnalysisStatus.NEEDS_ATTENTION,'모델 실행 실패',reason='MODEL_OUTCOME_UNKNOWN')
             self.assertEqual([],store.list_messages('session'))
             self.assertEqual([],store.list_messages(req.analysis_id))
-            self.assertTrue(any('장기 저장소 분석 · 완료' in x['text'] for x in store.deliverable_outbound('telegram')))
-            print('CONFIRMED: long result absent from chat history; error finalizer edits card to completed')
+            self.assertTrue(any('장기 저장소 분석 · 실패' in x['text'] for x in store.deliverable_outbound('telegram')))
+            print('S02 REGRESSION: error finalizer shows failure; S03 chat history defect remains')
 
-    def test_resume_drops_completed_stage_workspace(self):
+    def test_resume_preserves_completed_stage_workspace(self):
         class Runner(FakeRoleRunner):
             def __init__(self):
                 super().__init__(review_responses=[[]],development_outputs=['fixed'])
@@ -106,7 +107,7 @@ class AuditReproductions(unittest.TestCase):
             worker.machine.transition(paused,RunPhase.DEVELOPING,message='audit resume')
             worker.resume(run_id)
             worker.run_once()
-            self.assertEqual([True,False],runner.stage2_seen)
-            print('CONFIRMED: stage 2 resume creates a fresh source worktree without stage 1 output')
+            self.assertEqual([True,True],runner.stage2_seen)
+            print('S08 REGRESSION: stage 2 resume preserves stage 1 output and candidate')
 
 if __name__=='__main__': unittest.main(verbosity=2)

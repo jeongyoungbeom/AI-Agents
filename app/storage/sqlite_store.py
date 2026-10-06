@@ -22,6 +22,7 @@ from app.contracts import (
     TaskDefinitionState,
     TokenUsage,
 )
+from app.contracts.outcomes import RequestOutcome, RequestResult
 from app.contracts.models import utc_now
 from app.services.repository.analysis import (
     RepositoryAnalysisPhase,
@@ -35,6 +36,10 @@ class StoreError(RuntimeError):
 
 
 class ConcurrentUpdateError(StoreError):
+    pass
+
+
+class ExecutionInputPending(StoreError):
     pass
 
 
@@ -205,6 +210,19 @@ class StateStore:
             created_at TEXT NOT NULL,
             settled_at TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS model_calls (
+            call_id TEXT PRIMARY KEY,
+            logical_id TEXT NOT NULL,
+            request_key TEXT NOT NULL,
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            stage_id TEXT NOT NULL,
+            role_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            reservation_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_calls_logical ON model_calls(logical_id, status);
         CREATE TABLE IF NOT EXISTS conversation_bindings (
             channel TEXT NOT NULL,
             conversation_id TEXT NOT NULL,
@@ -778,10 +796,221 @@ class StateStore:
                 (utc_now(),),
             )
 
+        if connection.execute("SELECT 1 FROM schema_migrations WHERE version = 9").fetchone() is None:
+            if not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "CREATE TABLE conversation_request_results ("
+                "channel TEXT NOT NULL, conversation_id TEXT NOT NULL, "
+                "external_message_id TEXT NOT NULL, result_json TEXT NOT NULL, "
+                "PRIMARY KEY(channel, conversation_id, external_message_id))"
+            )
+            connection.execute(
+                "ALTER TABLE repository_analysis_jobs ADD COLUMN model_attempts INTEGER DEFAULT 0"
+            )
+            connection.execute(
+                "ALTER TABLE repository_analysis_jobs ADD COLUMN model_successes INTEGER DEFAULT 0"
+            )
+            connection.execute("UPDATE repository_analysis_jobs SET model_attempts = NULL, model_successes = NULL")
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)", (utc_now(),)
+            )
+
+        if connection.execute('SELECT 1 FROM schema_migrations WHERE version = 10').fetchone() is None:
+            if not connection.in_transaction:
+                connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                'CREATE TABLE IF NOT EXISTS pipeline_workspaces ('
+                'run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE, '
+                'checkpoint_json TEXT NOT NULL, updated_at TEXT NOT NULL)'
+            )
+            connection.execute(
+                'INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?)', (utc_now(),),
+            )
+
+        if connection.execute('SELECT 1 FROM schema_migrations WHERE version = 11').fetchone() is None:
+            if not connection.in_transaction:
+                connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                'CREATE TABLE IF NOT EXISTS execution_inputs ('
+                'input_id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE, '
+                'channel TEXT NOT NULL, conversation_id TEXT NOT NULL, '
+                'user_id TEXT NOT NULL, message_id TEXT NOT NULL, role_id TEXT NOT NULL, '
+                'text TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, '
+                'created_at TEXT NOT NULL, updated_at TEXT NOT NULL, '
+                'UNIQUE(channel, conversation_id, message_id))'
+            )
+            connection.execute('CREATE INDEX IF NOT EXISTS idx_execution_inputs_run ON execution_inputs(run_id, input_id)')
+            connection.execute('INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?)', (utc_now(),))
+
+    def capture_execution_input(self, channel, conversation_id, user_id, message_id, text):
+        """수신 시점의 소유자/작업을 고정한다. 모델 해석은 권한을 만들지 않는다."""
+        with self.transaction(), self._connection() as connection:
+            existing = connection.execute(
+                'SELECT * FROM execution_inputs WHERE channel=? AND conversation_id=? AND message_id=?',
+                (channel, conversation_id, message_id),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            binding = self.load_conversation(channel, conversation_id)
+            if not binding or binding['user_id'] != user_id:
+                return None
+            run_id = binding.get('active_task_id')
+            job = self.pipeline_job(run_id) if run_id else None
+            state = self.load_run(run_id) if run_id else None
+            role_id = binding['active_role']
+            pipeline_active = (job and job['status'] in {'QUEUED', 'RUNNING', 'PAUSE_REQUESTED', 'NEEDS_ATTENTION'}
+                               and state.phase.value not in {'COMPLETED', 'CANCELLED', 'FAILED'})
+            if pipeline_active:
+                if self.open_execution_question_for_run(run_id) is not None:
+                    return None
+            else:
+                analysis = self.active_repository_analysis(channel, conversation_id)
+                if not analysis or analysis['user_id'] != user_id or analysis['status'] not in {'QUEUED', 'PROCESSING', 'PAUSED'}:
+                    return None
+                run_id, role_id = analysis['analysis_id'], analysis['role_id']
+            now = utc_now()
+            cursor = connection.execute(
+                'INSERT INTO execution_inputs(run_id, channel, conversation_id, user_id, message_id, role_id, text, status, intent_json, created_at, updated_at) '
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'RECEIVED', '{}', ?, ?)",
+                (run_id, channel, conversation_id, user_id, message_id, role_id, text, now, now),
+            )
+            self.queue_outbound(channel, conversation_id, '중간 메시지를 받았습니다. 다음 안전 지점에서 해석과 반영 여부를 확인합니다.', reply_to=message_id)
+            return dict(connection.execute('SELECT * FROM execution_inputs WHERE input_id=?', (cursor.lastrowid,)).fetchone())
+
+    def execution_inputs(self, run_id):
+        with self._lock, self._connection() as connection:
+            rows = connection.execute('SELECT * FROM execution_inputs WHERE run_id=? ORDER BY input_id', (run_id,)).fetchall()
+        return [{**dict(row), 'intent': json.loads(row['intent_json'])} for row in rows]
+
+    def execution_input(self, input_id):
+        with self._lock, self._connection() as connection:
+            row = connection.execute('SELECT * FROM execution_inputs WHERE input_id=?', (input_id,)).fetchone()
+        return {**dict(row), 'intent': json.loads(row['intent_json'])} if row else None
+
+    def execution_input_is_current(self, entry):
+        binding = self.load_conversation(entry['channel'], entry['conversation_id'])
+        if not binding or binding['user_id'] != entry['user_id']:
+            return False
+        if self.pipeline_job(entry['run_id']):
+            return binding.get('active_task_id') == entry['run_id'] and self.load_run(entry['run_id']).phase.value not in {'COMPLETED', 'CANCELLED', 'FAILED'}
+        analysis = self.active_repository_analysis(entry['channel'], entry['conversation_id'])
+        return bool(analysis and analysis['analysis_id'] == entry['run_id'] and analysis['status'] in {'QUEUED', 'PROCESSING', 'PAUSED'})
+
+    def request_execution_input_clarification(self, input_id, intent):
+        """확정 실패의 응답/확인 대상을 보존한다. 미처리 정상 입력은 건드리지 않는다."""
+        with self.transaction(), self._connection() as connection:
+            row = connection.execute('SELECT * FROM execution_inputs WHERE input_id=?', (input_id,)).fetchone()
+            if row is None:
+                raise StoreError('execution input is missing')
+            if row['status'] == 'RECEIVED' and self.execution_input_is_current(dict(row)):
+                connection.execute('UPDATE execution_inputs SET intent_json=?, updated_at=? WHERE input_id=?',
+                    (json.dumps({**intent, 'clarification_required': True}, ensure_ascii=False), utc_now(), input_id))
+
+    def resolve_execution_input(self, input_id, intent, *, blocked=False):
+        with self.transaction(), self._connection() as connection:
+            row = connection.execute('SELECT * FROM execution_inputs WHERE input_id=?', (input_id,)).fetchone()
+            if row is None:
+                raise StoreError('execution input is missing')
+            if not self.execution_input_is_current(dict(row)):
+                status = 'SUPERSEDED'
+            elif row['status'] != 'RECEIVED':
+                return row['status']
+            else:
+                status = 'WAITING_APPROVAL' if blocked else 'ANSWERED' if intent['action'] == 'question' else 'READY'
+                if status == 'READY':
+                    clarifies = intent.get('clarifies_input_ids', [])
+                    if (not isinstance(clarifies, list) or len(clarifies) > 32
+                            or any(type(item) is not int or item <= 0 for item in clarifies)):
+                        raise StoreError('invalid execution clarification references')
+                    for target_id in set(clarifies):
+                        target = connection.execute('SELECT * FROM execution_inputs WHERE input_id=?', (target_id,)).fetchone()
+                        if (target is None or target['run_id'] != row['run_id'] or target_id >= input_id
+                                or any(target[key] != row[key] for key in ('channel', 'conversation_id', 'user_id'))
+                                or target['status'] != 'RECEIVED'
+                                or not json.loads(target['intent_json']).get('clarification_required')):
+                            raise StoreError('execution clarification does not match a pending question')
+                        previous_intent = {**json.loads(target['intent_json']), 'clarified_by_input_id': input_id}
+                        connection.execute("UPDATE execution_inputs SET status='SUPERSEDED', intent_json=?, updated_at=? WHERE input_id=?",
+                            (json.dumps(previous_intent, ensure_ascii=False), utc_now(), target_id))
+                    # 새 범위 내 지시는 이전의 범위 확대 제안을 대체할 수 있지만 권한은 늘리지 않는다.
+                    connection.execute("UPDATE execution_inputs SET status='SUPERSEDED', updated_at=? WHERE run_id=? AND status='WAITING_APPROVAL' AND input_id<?", (utc_now(), row['run_id'], input_id))
+            connection.execute('UPDATE execution_inputs SET status=?, intent_json=?, updated_at=? WHERE input_id=?',
+                               (status, json.dumps(intent, ensure_ascii=False), utc_now(), input_id))
+            return status
+
+    def apply_execution_inputs(self, run_id, lease_owner):
+        with self.transaction(), self._connection() as connection:
+            if self.pipeline_job(run_id):
+                self.assert_pipeline_owner(run_id, lease_owner)
+            else:
+                row = connection.execute("SELECT 1 FROM repository_analysis_jobs WHERE analysis_id=? AND lease_owner=? AND status='PROCESSING'", (run_id, lease_owner)).fetchone()
+                if not row:
+                    raise StoreError('analysis input is not owned')
+            if any(item['status'] in {'RECEIVED', 'WAITING_APPROVAL'} for item in self.execution_inputs(run_id)):
+                return []
+            ready = [item for item in self.execution_inputs(run_id) if item['status'] == 'READY']
+            connection.execute("UPDATE execution_inputs SET status='APPLIED', updated_at=? WHERE run_id=? AND status='READY'", (utc_now(), run_id))
+            return ready
+
+    def discard_steered_analysis_attempt(self, analysis_id, lease_owner, *, read_bytes=0, model_completed=False):
+        with self.transaction(), self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE repository_analysis_jobs SET model_call_state='IDLE', query_rounds=query_rounds+?, model_calls=model_calls+?, read_bytes=read_bytes+? "
+                "WHERE analysis_id=? AND lease_owner=? AND status='PROCESSING'",
+                (int(bool(model_completed)), int(bool(model_completed)), read_bytes, analysis_id, lease_owner))
+            if cursor.rowcount != 1:
+                raise StoreError('analysis attempt is not owned')
+
+    def assert_no_pending_execution_input(self, run_id):
+        if any(item['status'] in {'RECEIVED', 'READY', 'WAITING_APPROVAL'} for item in self.execution_inputs(run_id)):
+            raise ExecutionInputPending('STEERING_PENDING')
+
+    def save_conversation_result(
+        self, channel: str, conversation_id: str, external_message_id: str,
+        result: RequestResult,
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO conversation_request_results VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(channel, conversation_id, external_message_id) "
+                "DO UPDATE SET result_json = excluded.result_json",
+                (channel, conversation_id, external_message_id,
+                 json.dumps(result.to_dict(), ensure_ascii=False)),
+            )
+
+    def conversation_result(
+        self, channel: str, conversation_id: str, external_message_id: str,
+    ) -> RequestResult | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM conversation_request_results "
+                "WHERE channel = ? AND conversation_id = ? AND external_message_id = ?",
+                (channel, conversation_id, external_message_id),
+            ).fetchone()
+        return RequestResult.from_dict(json.loads(row["result_json"])) if row else None
+
+    def record_repository_analysis_call(self, analysis_id: str, lease_owner: str, *, succeeded: bool = False) -> None:
+        column = "model_successes" if succeeded else "model_attempts"
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                f"UPDATE repository_analysis_jobs SET {column} = {column} + 1 "
+                "WHERE analysis_id = ? AND lease_owner = ? AND status IN ('PROCESSING', 'STOP_REQUESTED')",
+                (analysis_id, lease_owner),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError(f"repository analysis call is not owned: {analysis_id}")
+
     @staticmethod
     def _queue_repository_analysis_final(
         connection: sqlite3.Connection, job: sqlite3.Row, response: str, now: str,
+        status: RepositoryAnalysisStatus, reason: str,
     ) -> int:
+        result = RequestResult.for_analysis(
+            status.value, reason, attempts=job["model_attempts"],
+            successes=job["model_successes"],
+        )
         progress_id = int(job["progress_outbound_id"])
         if progress_id:
             connection.execute(
@@ -791,8 +1020,9 @@ class StateStore:
                 "VALUES (?, ?, ?, ?, 'edit', ?, ?, 'PENDING', 0, '[]', '', ?, ?)",
                 (
                     str(job["channel"]), str(job["conversation_id"]),
-                    "[장기 저장소 분석 · 완료]\n최종 답변을 별도 메시지로 전송합니다. "
-                    "전달에 문제가 있으면 '분석 결과'로 조회해 주세요.",
+                    f"[장기 저장소 분석 · {result.outcome.label}]\n"
+                    + result.calls_text + f"\n종료 사유: {reason}\n"
+                    + "최종 결과를 발신함에 저장했습니다. '분석 결과'로 전달 상태를 조회할 수 있습니다.",
                     str(job["source_message_id"]), progress_id,
                     f"repository-analysis:{job['analysis_id']}", now, now,
                 ),
@@ -808,6 +1038,39 @@ class StateStore:
             ),
         )
         return int(cursor.lastrowid)
+
+    def _append_analysis_result_to_session(
+        self, connection: sqlite3.Connection, job: sqlite3.Row,
+        response: str, status: RepositoryAnalysisStatus, reason: str, now: str,
+    ) -> None:
+        session = connection.execute(
+            "SELECT session_run_id FROM conversation_sessions WHERE channel = ? "
+            "AND conversation_id = ? AND user_id = ?",
+            (job["channel"], job["conversation_id"], job["user_id"]),
+        ).fetchone()
+        if session is None:
+            return
+        refs = connection.execute(
+            "SELECT evidence_id, path, start_line, end_line FROM repository_analysis_evidence "
+            "WHERE analysis_id = ? ORDER BY evidence_id LIMIT 12",
+            (job["analysis_id"],),
+        ).fetchall()
+        data = {
+            "repository_identity": str(job["repository_identity"]),
+            "head_sha": str(job["commit_sha"]),
+            "analysis_id": str(job["analysis_id"]),
+            "source_ref": f"repository-analysis:{job['analysis_id']}",
+            "status": status.value,
+            "reason": reason,
+            "evidence_refs": [dict(item) for item in refs],
+            "untrusted_repository_data": True,
+        }
+        connection.execute(
+            "INSERT INTO messages(run_id, timestamp, sender, kind, content, data_json) "
+            "VALUES (?, ?, ?, 'analysis_result', ?, ?)",
+            (str(session["session_run_id"]), now, str(job["role_id"]),
+             response.strip()[:8000], json.dumps(data, ensure_ascii=False, sort_keys=True)),
+        )
 
     def save_pending_repository_audit(
         self, channel: str, conversation_id: str, user_id: str,
@@ -1198,6 +1461,28 @@ class StateStore:
                 ),
             )
 
+    def append_message_once(
+        self, run_id: str, sender: str, kind: str, content: str,
+        data: dict[str, Any], *, key: str,
+    ) -> bool:
+        """Insert one sourced event atomically, including across worker processes."""
+        with self.transaction():
+            with self._connection() as connection:
+                rows = connection.execute(
+                    "SELECT data_json FROM messages WHERE run_id = ? AND kind = ?",
+                    (run_id, kind),
+                ).fetchall()
+                if any(json.loads(str(row["data_json"])).get("evidence_key") == key
+                       for row in rows):
+                    return False
+                connection.execute(
+                    "INSERT INTO messages(run_id, timestamp, sender, kind, content, data_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (run_id, utc_now(), sender, kind, content,
+                     json.dumps(data, ensure_ascii=False, sort_keys=True)),
+                )
+                return True
+
     def list_messages(self, run_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
@@ -1220,10 +1505,17 @@ class StateStore:
         self, channel: str, conversation_id: str, external_message_id: str
     ) -> list[str]:
         """중단된 워커가 이미 확정한 응답을 발신함으로 복구한다."""
+        result = self.conversation_result(channel, conversation_id, external_message_id)
+        if result and result.reason in {"RUNNING", "PROCESSING_FAILED"}:
+            return []
+        binding = self.load_conversation(channel, conversation_id)
+        if binding is None:
+            return []
         with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT content, data_json FROM messages "
-                "WHERE kind = 'assistant_message' ORDER BY message_id"
+                "WHERE kind = 'assistant_message' AND run_id = ? ORDER BY message_id",
+                (binding["run_id"],),
             ).fetchall()
         responses: list[str] = []
         for row in rows:
@@ -1234,6 +1526,8 @@ class StateStore:
                 and str(data.get("external_message_id", ""))
                 == external_message_id
             ):
+                if "request_result" in data:
+                    responses.clear()
                 responses.append(str(row["content"]))
         return responses
 
@@ -1272,6 +1566,131 @@ class StateStore:
         with self._lock, self._connection() as connection:
             row = connection.execute(query, parameters).fetchone()
         return int(row["total"] if row else 0)
+
+    def model_call(self, call_id: str) -> dict | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT * FROM model_calls WHERE call_id = ?", (call_id,)).fetchone()
+        return dict(row) if row else None
+
+    def token_reservation(self, reservation_id: str) -> dict | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT * FROM token_reservations WHERE reservation_id = ?",
+                                     (reservation_id,)).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def model_request_key(channel: str, conversation_id: str, external_message_id: str) -> str:
+        return hashlib.sha256(json.dumps([channel, conversation_id, external_message_id]).encode("utf-8")).hexdigest()
+
+    def model_calls_for_request(self, request_key: str) -> tuple[dict, ...]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute("SELECT * FROM model_calls WHERE request_key = ? ORDER BY rowid", (request_key,)).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def has_budget_anomaly(self, run_id: str) -> bool:
+        return bool(self.budget_anomalies(run_id))
+
+    def budget_control_events(self, run_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT event_id, event_type, data_json FROM events WHERE run_id = ? "
+                "AND event_type IN ('BUDGET_RESERVATION_EXCEEDED', 'MODEL_USAGE_UNKNOWN', "
+                "'BUDGET_OVERRUN_ACKNOWLEDGED', 'BUDGET_BASELINE_RESET') ORDER BY event_id",
+                (run_id,),
+            ).fetchall()
+        return [dict(event_id=row['event_id'], event_type=row['event_type'],
+                     data=json.loads(row['data_json'])) for row in rows]
+
+    def budget_anomalies(self, run_id: str) -> list[dict[str, Any]]:
+        events = self.budget_control_events(run_id)
+        acknowledged = {event['data']['event_id'] for event in events
+                        if event['event_type'] == 'BUDGET_OVERRUN_ACKNOWLEDGED'}
+        return [event for event in events if event['event_type'] == 'MODEL_USAGE_UNKNOWN'
+                or (event['event_type'] == 'BUDGET_RESERVATION_EXCEEDED'
+                    and event['event_id'] not in acknowledged)]
+
+    def budget_usage_cursor(self, run_id: str) -> int:
+        events = self.budget_control_events(run_id)
+        return next((int(event['data']['usage_id']) for event in reversed(events)
+                     if event['event_type'] == 'BUDGET_BASELINE_RESET'), 0)
+
+    def latest_usage_id(self, run_id: str) -> int:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(usage_id), 0) AS usage_id FROM usage_ledger WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row['usage_id'])
+
+    def budget_usage_total(self, run_id: str, stage_id: str | None = None,
+                           *, category: str | None = None) -> int:
+        with self._lock, self._connection() as connection:
+            query = ("SELECT COALESCE(SUM(total_tokens), 0) AS total FROM usage_ledger "
+                     "WHERE run_id = ? AND usage_id > COALESCE((SELECT "
+                     "json_extract(data_json, '$.usage_id') FROM events WHERE run_id = ? "
+                     "AND event_type = 'BUDGET_BASELINE_RESET' ORDER BY event_id DESC LIMIT 1), 0)")
+            parameters: list[Any] = [run_id, run_id]
+            if stage_id is not None:
+                query += " AND stage_id = ?"
+                parameters.append(stage_id)
+            if category is not None:
+                query += " AND category = ?"
+                parameters.append(category)
+            row = connection.execute(query, parameters).fetchone()
+        return int(row['total'])
+
+    def has_active_model_calls(self, run_id: str) -> bool:
+        with self._lock, self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM model_calls WHERE run_id = ? AND status = 'RUNNING' LIMIT 1",
+                (run_id,),
+            ).fetchone() is not None
+
+    def completed_model_call(self, logical_id: str) -> dict | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_calls WHERE logical_id = ? AND status = 'COMPLETED' LIMIT 1",
+                (logical_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_model_call(self, call_id: str, logical_id: str, run_id: str, stage_id: str,
+                          role_id: str, category: str, reservation_id: str, request_key: str) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO model_calls(call_id, logical_id, run_id, stage_id, role_id, category, "
+                "reservation_id, request_key, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')",
+                (call_id, logical_id, run_id, stage_id, role_id, category, reservation_id, request_key),
+            )
+
+    def finish_model_call(self, call_id: str, status: str, result: dict) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "UPDATE model_calls SET status = ?, result_json = ? WHERE call_id = ? AND status = 'RUNNING'",
+                (status, json.dumps(result, ensure_ascii=False), call_id),
+            )
+
+    def running_model_calls(self, run_id: str, stage_id: str, request_key: str = "") -> tuple[dict, ...]:
+        query = (
+            "SELECT m.*, r.reserved_tokens FROM model_calls m JOIN token_reservations r "
+            "ON r.reservation_id = m.reservation_id WHERE m.run_id = ? AND m.stage_id = ? "
+            "AND m.status = 'RUNNING'"
+        )
+        parameters = [run_id, stage_id]
+        if request_key:
+            query += " AND m.request_key = ?"
+            parameters.append(request_key)
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def interrupted_call_scopes(self, request_key: str) -> tuple[tuple[str, str], ...]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT run_id, stage_id FROM model_calls WHERE request_key = ? AND status = 'RUNNING'",
+                (request_key,),
+            ).fetchall()
+        return tuple((row["run_id"], row["stage_id"]) for row in rows)
 
     def usage_total_by_category(self, run_id: str, category: str) -> int:
         with self._lock, self._connection() as connection:
@@ -1876,6 +2295,22 @@ class StateStore:
         if selected is None:
             raise StoreError("project selection was not saved")
         return selected
+
+    def refresh_project_head(
+        self, channel: str, conversation_id: str, user_id: str,
+        repository_identity: str, head_sha: str,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{40,64}", head_sha):
+            raise ValueError("repository head must be a Git object id")
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE conversation_projects SET head_sha = ? WHERE channel = ? "
+                "AND conversation_id = ? AND user_id = ? AND repository_identity = ? "
+                "AND approved = 1",
+                (head_sha, channel, conversation_id, user_id, repository_identity),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("approved project changed during snapshot read")
 
     def set_current_project_approval(
         self,
@@ -2794,6 +3229,7 @@ class StateStore:
         no_progress_count: int,
         file_exclusions: list[dict[str, str]] | None = None,
         analysis_partial_reasons: list[str] | None = None,
+        plan_update: dict[str, Any] | None = None,
         final_response: str = "",
         final_status: RepositoryAnalysisStatus = RepositoryAnalysisStatus.COMPLETED,
         final_reason: str = "COMPLETED",
@@ -2817,6 +3253,7 @@ class StateStore:
                 ).fetchone()
                 if job is None:
                     raise StoreError(f"repository analysis batch is not owned: {analysis_id}")
+                self.assert_no_pending_execution_input(analysis_id)
                 batch = connection.execute(
                     "SELECT * FROM repository_analysis_batches WHERE analysis_id = ? AND batch_index = ? "
                     "AND status = 'PENDING'",
@@ -2826,12 +3263,29 @@ class StateStore:
                     raise StoreError(f"repository analysis batch is not pending: {batch_index}")
                 phase = str(batch["phase"])
                 plan = json.loads(str(job["plan_json"]))
+                if plan_update is not None:
+                    if (plan_update.get("commit_sha") != plan["commit_sha"]
+                            or plan_update.get("identity_hash") != plan["identity_hash"]):
+                        raise ValueError("repository analysis checkpoint snapshot changed")
+                    plan = plan_update
+                    connection.execute(
+                        "DELETE FROM repository_analysis_batches WHERE analysis_id = ? "
+                        "AND status = 'PENDING' AND batch_index <> ?", (analysis_id, batch_index),
+                    )
+                    for index, target in enumerate(remaining, batch_index + 1):
+                        if target.get("batch_index") != index:
+                            raise ValueError("repository analysis continuation index is invalid")
+                        connection.execute(
+                            "INSERT INTO repository_analysis_batches(analysis_id, batch_index, phase, target_json, "
+                            "status, created_at, completed_at) VALUES (?, ?, ?, ?, 'PENDING', ?, '')",
+                            (analysis_id, index, target["phase"], json.dumps(target, ensure_ascii=False, sort_keys=True), now),
+                        )
                 if file_exclusions:
                     planned_paths = set(json.loads(str(batch["target_json"])).get("paths", []))
                     for exclusion in file_exclusions:
                         path = str(exclusion["path"])
                         reason = str(exclusion["reason"])
-                        if path not in planned_paths or reason not in {"binary_content", "non_utf8"}:
+                        if path not in planned_paths or reason not in {"binary_content", "non_utf8", "line_size_limit"}:
                             raise ValueError("repository analysis file exclusion is invalid")
                         file_entry = next(
                             (item for item in plan["files"] if item["path"] == path), None
@@ -2840,7 +3294,8 @@ class StateStore:
                             raise ValueError("repository analysis excluded path is not planned")
                         file_entry["exclude_reason"] = reason
                         file_entry["eligible"] = False
-                        plan["excluded"][reason] = plan["excluded"].get(reason, 0) + 1
+                        file_entry["excluded_from_line"] = json.loads(str(batch["target_json"])).get("start_lines", {}).get(path, 1)
+                        plan["excluded"][reason] = sum(item.get("exclude_reason") == reason for item in plan["files"])
                     if "UNREADABLE_FILE" not in plan["partial_reasons"]:
                         plan["partial_reasons"].append("UNREADABLE_FILE")
                 for reason in analysis_partial_reasons or []:
@@ -2900,7 +3355,10 @@ class StateStore:
                     raise StoreError(f"repository analysis checkpoint is not owned: {analysis_id}")
                 if final_response.strip():
                     final_outbound_id = self._queue_repository_analysis_final(
-                        connection, job, final_response, now
+                        connection, job, final_response, now, final_status, final_reason
+                    )
+                    self._append_analysis_result_to_session(
+                        connection, job, final_response, final_status, final_reason, now
                     )
                     connection.execute(
                         "UPDATE repository_analysis_jobs SET status = ?, stop_reason = ?, "
@@ -3141,17 +3599,18 @@ class StateStore:
             raise StoreError(f"repository analysis disappeared: {analysis_id}")
         return self._repository_analysis_row(row)
 
-    def pause_repository_analysis(self, analysis_id: str, lease_owner: str) -> dict[str, Any]:
+    def pause_repository_analysis(self, analysis_id: str, lease_owner: str, *, reason: str = '') -> dict[str, Any]:
         now = utc_now()
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE repository_analysis_jobs SET status = 'PAUSED', model_call_state = 'IDLE', "
+                "stop_reason = CASE WHEN ? <> '' THEN ? ELSE stop_reason END, "
                 "lease_owner = '', lease_until = '', "
                 "active_seconds = active_seconds + CASE WHEN active_since = '' THEN 0 "
                 "ELSE MAX(0, (julianday(?) - julianday(active_since)) * 86400) END, "
                 "active_since = '', updated_at = ? WHERE analysis_id = ? "
                 "AND lease_owner = ? AND status IN ('PROCESSING', 'STOP_REQUESTED')",
-                (now, now, analysis_id, lease_owner),
+                (reason, reason, now, now, analysis_id, lease_owner),
             )
             if cursor.rowcount != 1:
                 raise StoreError(f"repository analysis cannot pause: {analysis_id}")
@@ -3216,8 +3675,13 @@ class StateStore:
                 ).fetchone()
                 if job is None:
                     raise StoreError(f"repository analysis cannot finish: {analysis_id}")
+                if status in {RepositoryAnalysisStatus.COMPLETED, RepositoryAnalysisStatus.PARTIAL_COMPLETED}:
+                    self.assert_no_pending_execution_input(analysis_id)
                 final_outbound_id = self._queue_repository_analysis_final(
-                    connection, job, response, now
+                    connection, job, response, now, status, reason
+                )
+                self._append_analysis_result_to_session(
+                    connection, job, response, status, reason, now
                 )
                 cursor = connection.execute(
                     "UPDATE repository_analysis_jobs SET status = ?, stop_reason = ?, last_error = ?, "
@@ -3482,6 +3946,7 @@ class StateStore:
         status: str,
         messages: list[dict[str, str]] | None = None,
         error: str = "",
+        *, result: RequestResult | None = None,
     ) -> list[int]:
         if status not in {"COMPLETED", "FAILED", "CANCELLED", "NEEDS_ATTENTION"}:
             raise ValueError(f"unsupported conversation job status: {status}")
@@ -3489,6 +3954,21 @@ class StateStore:
         identifiers: list[int] = []
         with self.transaction():
             with self._connection() as connection:
+                job = connection.execute(
+                    "SELECT * FROM conversation_jobs WHERE job_id = ? AND lease_owner = ? "
+                    "AND status IN ('PROCESSING', 'CANCEL_REQUESTED')", (job_id, lease_owner),
+                ).fetchone()
+                if job is None:
+                    raise StoreError(f"conversation job is not owned: {job_id}")
+                previous = self.conversation_result(job["channel"], job["conversation_id"], job["external_message_id"])
+                result = result or previous or RequestResult(RequestOutcome.FAILED, "OUTCOME_UNKNOWN", None, None)
+                if job["status"] == "CANCEL_REQUESTED" or status == "CANCELLED":
+                    status, messages = "CANCELLED", []
+                    result = RequestResult(RequestOutcome.CANCELLED, "USER_CANCELLED",
+                                           result.attempts, result.successes, result.provider_requests)
+                self.save_conversation_result(
+                    job["channel"], job["conversation_id"], job["external_message_id"], result,
+                )
                 cursor = connection.execute(
                     "UPDATE conversation_jobs SET status = ?, last_error = ?, replay_cached = 0, "
                     "lease_owner = '', lease_until = '', updated_at = ? "
@@ -3539,17 +4019,31 @@ class StateStore:
         self, channel: str, conversation_id: str
     ) -> str | None:
         now = utc_now()
-        with self._lock, self._connection() as connection:
-            connection.execute(
-                "UPDATE conversation_jobs SET status = 'CANCELLED', updated_at = ? "
-                "WHERE channel = ? AND conversation_id = ? AND status = 'QUEUED'",
-                (now, channel, conversation_id),
-            )
-            connection.execute(
-                "UPDATE conversation_jobs SET status = 'CANCEL_REQUESTED', updated_at = ? "
-                "WHERE channel = ? AND conversation_id = ? AND status = 'PROCESSING'",
-                (now, channel, conversation_id),
-            )
+        with self.transaction():
+            with self._connection() as connection:
+                queued = connection.execute(
+                    "SELECT external_message_id FROM conversation_jobs "
+                    "WHERE channel = ? AND conversation_id = ? AND status = 'QUEUED'",
+                    (channel, conversation_id),
+                ).fetchall()
+                connection.execute(
+                    "UPDATE conversation_jobs SET status = 'CANCELLED', updated_at = ? "
+                    "WHERE channel = ? AND conversation_id = ? AND status = 'QUEUED'",
+                    (now, channel, conversation_id),
+                )
+                connection.execute(
+                    "UPDATE conversation_jobs SET status = 'CANCEL_REQUESTED', updated_at = ? "
+                    "WHERE channel = ? AND conversation_id = ? AND status = 'PROCESSING'",
+                    (now, channel, conversation_id),
+                )
+                for job in queued:
+                    previous = self.conversation_result(
+                        channel, conversation_id, job["external_message_id"],
+                    ) or RequestResult(RequestOutcome.CANCELLED)
+                    self.save_conversation_result(
+                        channel, conversation_id, job["external_message_id"],
+                        replace(previous, outcome=RequestOutcome.CANCELLED, reason="USER_CANCELLED"),
+                    )
         return self.conversation_job_status(channel, conversation_id)
 
     def conversation_job_cancel_requested(self, job_id: int) -> bool:
@@ -3574,18 +4068,22 @@ class StateStore:
                 "AND conversation_id = ? ORDER BY job_id DESC LIMIT 1",
                 (channel, conversation_id),
             ).fetchone()
-        return self._conversation_job_row(row) if row else None
+        job = self._conversation_job_row(row) if row else None
+        if job:
+            result = self.conversation_result(channel, conversation_id, job["external_message_id"])
+            job["result"] = result.to_dict() if result else None
+        return job
 
     def requeue_conversation_job(
-        self, channel: str, conversation_id: str
+        self, channel: str, conversation_id: str, *, job_id: int | None = None
     ) -> dict[str, Any] | None:
-        """Queue one interrupted job only when its completed response is durable."""
+        """완료 응답 또는 같은 작업의 완료 모델 결과가 있을 때만 재전송한다."""
         with self.transaction():
             with self._connection() as connection:
                 row = connection.execute(
                     "SELECT * FROM conversation_jobs WHERE channel = ? "
-                    "AND conversation_id = ? ORDER BY job_id DESC LIMIT 1",
-                    (channel, conversation_id),
+                    "AND conversation_id = ? AND (? IS NULL OR job_id = ?) ORDER BY job_id DESC LIMIT 1",
+                    (channel, conversation_id, job_id, job_id),
                 ).fetchone()
                 if row is None:
                     return None
@@ -3595,8 +4093,22 @@ class StateStore:
                 cached = self.conversation_responses(
                     channel, conversation_id, job["external_message_id"]
                 )
-                if not cached:
+                binding = self.load_conversation(channel, conversation_id)
+                if not binding or binding["user_id"] != job["user_id"]:
                     return job
+                entry = self.execution_input(job['message'].get('metadata', {}).get('gateway_execution_input'))
+                resolved_input = bool(entry and self.execution_input_is_current(entry) and entry['user_id'] == job['user_id']
+                                      and entry['message_id'] == job['external_message_id'] and entry['status'] != 'RECEIVED'
+                                      and entry['intent'].get('response_text'))
+                if not cached and not resolved_input:
+                    calls = self.model_calls_for_request(self.model_request_key(
+                        channel, conversation_id, job["external_message_id"]))
+                    completed = {call["logical_id"] for call in calls if call["status"] == "COMPLETED"}
+                    target_run = entry['run_id'] if entry and self.execution_input_is_current(entry) else binding['run_id']
+                    if (not calls or not binding or binding["user_id"] != job["user_id"]
+                            or any(call["run_id"] != target_run or call["status"] == "RUNNING"
+                                   or call["logical_id"] not in completed for call in calls)):
+                        return job
                 now = utc_now()
                 cursor = connection.execute(
                     "UPDATE conversation_jobs SET status = 'QUEUED', replay_cached = 1, "
@@ -4009,6 +4521,17 @@ class StateStore:
                     "WHERE channel = ? AND status = 'FAILED' AND attempts >= ?",
                     (now_text, channel, max_attempts),
                 )
+                # 아직 전송하지 않은 이전 카드 편집은 더 최신 편집으로 대체한다.
+                connection.execute(
+                    "UPDATE outbound_messages AS older SET status = 'DEAD', "
+                    "last_error = 'superseded progress update', updated_at = ? "
+                    "WHERE older.channel = ? AND older.delivery_mode = 'edit' "
+                    "AND older.status IN ('PENDING', 'FAILED') AND EXISTS ("
+                    "SELECT 1 FROM outbound_messages AS newer "
+                    "WHERE newer.target_outbound_id = older.target_outbound_id "
+                    "AND newer.delivery_mode = 'edit' AND newer.outbound_id > older.outbound_id)",
+                    (now_text, channel),
+                )
                 row = connection.execute(
                     "SELECT outbound_id, channel, conversation_id, text, reply_to, "
                     "delivery_mode, target_outbound_id, status, attempts "
@@ -4071,7 +4594,7 @@ class StateStore:
         self, run_id: str, channel: str, conversation_id: str
     ) -> dict[str, Any]:
         now = utc_now()
-        with self._lock, self._connection() as connection:
+        with self.transaction(), self._connection() as connection:
             try:
                 connection.execute(
                     "INSERT INTO pipeline_jobs(run_id, channel, conversation_id, status, "
@@ -4084,6 +4607,16 @@ class StateStore:
                 if existing is None:
                     raise
                 return existing
+            session = connection.execute(
+                "SELECT session_run_id FROM conversation_sessions WHERE channel = ? "
+                "AND conversation_id = ?",
+                (channel, conversation_id),
+            ).fetchone()
+            if session is not None:
+                self.append_message(
+                    run_id, "gateway", "pipeline_parent", "개발 작업의 부모 대화 연결",
+                    {"session_run_id": str(session["session_run_id"])},
+                )
         queued = self.pipeline_job(run_id)
         if queued is None:
             raise StoreError(f"pipeline job was not saved: {run_id}")
@@ -4154,11 +4687,44 @@ class StateStore:
             cursor = connection.execute(
                 "UPDATE pipeline_jobs SET lease_until = ?, updated_at = ? "
                 "WHERE run_id = ? AND lease_owner = ? "
-                "AND status IN ('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED')",
-                (lease_until, now.isoformat(), run_id, lease_owner),
+                "AND status IN ('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED') "
+                "AND lease_until > ?",
+                (lease_until, now.isoformat(), run_id, lease_owner, now.isoformat()),
             )
             if cursor.rowcount != 1:
                 raise StoreError(f"pipeline job lease was lost: {run_id}")
+
+    def assert_pipeline_owner(self, run_id: str, lease_owner: str) -> None:
+        job = self.pipeline_job(run_id)
+        if not (job and job['lease_owner'] == lease_owner
+                and job['status'] in {'RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED'}
+                and job['lease_until'] > utc_now()):
+            raise StoreError(f"pipeline job lease was lost: {run_id}")
+
+    def pipeline_workspace(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                'SELECT checkpoint_json FROM pipeline_workspaces WHERE run_id = ?',
+                (run_id,),
+            ).fetchone()
+        return json.loads(row['checkpoint_json']) if row else None
+
+    def save_pipeline_workspace(
+        self, run_id: str, lease_owner: str, checkpoint: dict[str, Any]
+    ) -> None:
+        with self.transaction(), self._connection() as connection:
+            self.assert_pipeline_owner(run_id, lease_owner)
+            state = self.load_run(run_id)
+            if (checkpoint['run_id'] != run_id
+                    or checkpoint['plan_hash'] != state.approved_plan_hash
+                    or checkpoint['stage_index'] != state.stage_index):
+                raise StoreError('pipeline checkpoint does not match the approved run')
+            connection.execute(
+                'INSERT INTO pipeline_workspaces(run_id, checkpoint_json, updated_at) '
+                'VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET '
+                'checkpoint_json = excluded.checkpoint_json, updated_at = excluded.updated_at',
+                (run_id, json.dumps(checkpoint, ensure_ascii=False, sort_keys=True), utc_now()),
+            )
 
     def finish_pipeline_job(
         self,
@@ -4169,15 +4735,78 @@ class StateStore:
     ) -> None:
         if status not in {"COMPLETED", "FAILED", "CANCELLED", "NEEDS_ATTENTION"}:
             raise ValueError(f"unsupported pipeline terminal status: {status}")
-        with self._lock, self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE pipeline_jobs SET status = ?, last_error = ?, lease_owner = '', "
-                "lease_until = '', updated_at = ? WHERE run_id = ? AND lease_owner = ? "
-                "AND status IN ('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED')",
-                (status, error, utc_now(), run_id, lease_owner),
-            )
-            if cursor.rowcount != 1:
-                raise StoreError(f"pipeline job is not owned by this worker: {run_id}")
+        with self.transaction():
+            with self._connection() as connection:
+                job = connection.execute(
+                    "SELECT channel, conversation_id FROM pipeline_jobs WHERE run_id = ? "
+                    "AND lease_owner = ? AND status IN "
+                    "('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED')",
+                    (run_id, lease_owner),
+                ).fetchone()
+                if job is None:
+                    raise StoreError(f"pipeline job is not owned by this worker: {run_id}")
+                now = utc_now()
+                cursor = connection.execute(
+                    "UPDATE pipeline_jobs SET status = ?, last_error = ?, lease_owner = '', "
+                    "lease_until = '', updated_at = ? WHERE run_id = ? AND lease_owner = ? "
+                    "AND status IN ('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED')",
+                    (status, error, now, run_id, lease_owner),
+                )
+                if cursor.rowcount != 1:
+                    raise StoreError(f"pipeline job is not owned by this worker: {run_id}")
+                parent = connection.execute(
+                    "SELECT data_json FROM messages WHERE run_id = ? AND kind = 'pipeline_parent' "
+                    "ORDER BY message_id LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if parent is not None:
+                    parent_run_id = json.loads(str(parent["data_json"]))["session_run_id"]
+                else:
+                    # Jobs queued before the parent marker use their durable channel binding.
+                    session = connection.execute(
+                        "SELECT session_run_id FROM conversation_sessions WHERE channel = ? "
+                        "AND conversation_id = ?",
+                        (job["channel"], job["conversation_id"]),
+                    ).fetchone()
+                    parent_run_id = str(session["session_run_id"]) if session else ""
+                if parent_run_id:
+                    state = self.load_run(run_id)
+                    details = (f"개발 작업 {run_id}: {status}. 목표: {state.objective[:500]}. "
+                               f"단계 위치: {state.stage_index + 1}/{state.stage_count}.")
+                    if error:
+                        details += f" 사유: {error[:500]}"
+                    data = {
+                        "source_ref": f"pipeline:{run_id}",
+                        "status": status,
+                        "repository_identity": state.repository_identity,
+                        "head_sha": state.repository_head_sha,
+                        "untrusted_repository_data": True,
+                    }
+                    checkpoint = self.pipeline_workspace(run_id)
+                    if checkpoint is not None:
+                        data.update({name: checkpoint[name] for name in (
+                            'stage_index', 'stage_base_sha', 'candidate_sha', 'validated_sha',
+                        )})
+                        data['checkpoint_status'] = checkpoint['status']
+                        data['worktree_path'] = checkpoint['worktree']['worktree_path']
+                        data['execution_evidence'] = checkpoint.get('execution_evidence', {})
+                        details += (f" 현재 코드: {checkpoint['candidate_sha']}. "
+                                    f"마지막 검증: {checkpoint['validated_sha']}.")
+                        for stage_id, evidence in data['execution_evidence'].items():
+                            details += f" {stage_id} 변경 파일: {', '.join(evidence['changed_files']) or '(없음)'}."
+                            for result in evidence['commands']:
+                                if result.get('started', True):
+                                    details += f" 실행: {result['command']} ({result['failure_kind']}, exit={result['return_code']})."
+                                else:
+                                    details += f" 시작 실패: {result['command']} ({result['failure_kind']})."
+                            if evidence['unperformed_commands']:
+                                details += f" 미수행: {', '.join(evidence['unperformed_commands'])}."
+                    connection.execute(
+                        "INSERT INTO messages(run_id, timestamp, sender, kind, content, data_json) "
+                        "VALUES (?, ?, 'gateway', 'pipeline_result', ?, ?)",
+                        (parent_run_id, now, details,
+                         json.dumps(data, ensure_ascii=False, sort_keys=True)),
+                    )
 
     def request_pipeline_cancel(self, run_id: str) -> str | None:
         now = utc_now()
@@ -4379,8 +5008,13 @@ class StateStore:
         with self.transaction():
             with self._connection() as connection:
                 connection.execute(
-                    "DELETE FROM repository_execution_locks WHERE lease_until <= ?",
-                    (now_text,),
+                    "DELETE FROM repository_execution_locks WHERE lease_until <= ? "
+                    "AND NOT EXISTS (SELECT 1 FROM pipeline_jobs WHERE "
+                    "pipeline_jobs.run_id = repository_execution_locks.run_id "
+                    "AND pipeline_jobs.lease_owner = repository_execution_locks.lease_owner "
+                    "AND pipeline_jobs.status IN ('RUNNING', 'CANCEL_REQUESTED', 'PAUSE_REQUESTED') "
+                    "AND pipeline_jobs.lease_until > ?)",
+                    (now_text, now_text),
                 )
                 try:
                     connection.execute(
@@ -4414,17 +5048,27 @@ class StateStore:
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE repository_execution_locks SET lease_until = ?, updated_at = ? "
-                "WHERE path_hash = ? AND run_id = ? AND lease_owner = ?",
+                "WHERE path_hash = ? AND run_id = ? AND lease_owner = ? AND lease_until > ?",
                 (
                     lease_until,
                     now.isoformat(),
                     self._repository_hash(repository_path),
                     run_id,
                     lease_owner,
+                    now.isoformat(),
                 ),
             )
             if cursor.rowcount != 1:
                 raise StoreError(f"repository execution lock was lost: {repository_path}")
+
+    def repository_lock_owned(self, repository_path: str, run_id: str, lease_owner: str) -> bool:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                'SELECT 1 FROM repository_execution_locks WHERE path_hash = ? '
+                'AND run_id = ? AND lease_owner = ? AND lease_until > ?',
+                (self._repository_hash(repository_path), run_id, lease_owner, utc_now()),
+            ).fetchone()
+        return row is not None
 
     def release_repository_lock(
         self, repository_path: str, run_id: str, lease_owner: str
@@ -4460,6 +5104,12 @@ class StateStore:
             "model_call_state": str(row["model_call_state"]),
             "query_rounds": int(row["query_rounds"]),
             "model_calls": int(row["model_calls"]),
+            "model_attempts": row["model_attempts"],
+            "model_successes": row["model_successes"],
+            "result": RequestResult.for_analysis(
+                str(row["status"]), str(row["stop_reason"]),
+                attempts=row["model_attempts"], successes=row["model_successes"],
+            ).to_dict() if str(row["status"]) not in {"QUEUED", "PROCESSING", "STOP_REQUESTED"} else None,
             "read_bytes": int(row["read_bytes"]),
             "no_progress_count": int(row["no_progress_count"]),
             "progress_outbound_id": int(row["progress_outbound_id"]),

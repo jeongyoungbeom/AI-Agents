@@ -16,9 +16,6 @@ from .parsing import InvalidAgentResponse, parse_team_conversation_reply
 from .prompts import team_conversation_prompt
 
 
-NO_TOOLS_TOOLSET = "__ai_agents_free_chat_no_tools__"
-
-
 class HermesTeamConversationBackend:
     """범용 도구 없이 게이트웨이 중개 조회만 쓰는 Hermes 자유 대화를 실행한다."""
 
@@ -26,7 +23,7 @@ class HermesTeamConversationBackend:
         self.foundation = foundation
         self.runner = runner
         self.runtime_directory = foundation.root / "data" / "conversation-runtime"
-        self.supports_output_token_limit = True
+        self.supports_output_token_limit = runner.settings.provider != "openai-codex"
         self.supports_cancellation = True
 
     def respond_as(
@@ -65,9 +62,7 @@ class HermesTeamConversationBackend:
             allow_writes=False,
             model=settings.model,
             reasoning=settings.reasoning,
-            # Hermes treats an explicit unknown toolset as an empty set. This unique
-            # private name keeps free chat tool-free even if CLI defaults change.
-            toolsets=NO_TOOLS_TOOLSET,
+            no_tools=True,
             max_turns=1,
             max_output_tokens=max_output_tokens,
             image_path=accepted_image_path(
@@ -136,4 +131,13 @@ class HermesTeamConversationBackend:
             caller_role=caller_role,
             call_purpose=call_purpose,
             turn_messages=turn_messages,
+            user_intent=message.metadata.get("user_intent"),
         )
+
+    def invocation_token_estimate(self, input_tokens: int, output_tokens: int) -> int:
+        return input_tokens + output_tokens  # no_tools=True, max_turns=1
+
+    def call_input_fingerprint(self, state, context, message, role_id, **kwargs) -> str:
+        kwargs.pop("call_index", None)
+        payload = f"{self.runner.settings!r}\n{self._prompt(context, message, role_id, **kwargs)}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()

@@ -2,20 +2,18 @@
 from pathlib import Path
 import unittest
 from app.agents.parsing import parse_team_conversation_reply, InvalidAgentResponse
-from app.agents.team_conversation_backend import NO_TOOLS_TOOLSET
 from app.contracts import RoleId
 from app.services.repository import RepositoryToolBatch, RepositoryToolRequest
 from tests.gateway.support import temporary_directory, build_application, TEST_REPOSITORY_IDENTITY, future_expiry
 from tests.gateway.test_conversation_foundation import incoming
 
 class BoundaryReproductions(unittest.TestCase):
-    def test_warning_before_valid_json_breaks_response_contract(self):
+    def test_warning_before_valid_json_is_rejected_as_malformed_payload(self):
         payload='{"message":"정상 응답","calls":[],"memory_updates":[],"repository_tools":[]}'
         self.assertEqual('정상 응답', parse_team_conversation_reply(payload, RoleId.REVIEW).text)
-        actual_prefix=f'Warning: Unknown toolsets: {NO_TOOLS_TOOLSET}\n'
+        actual_prefix='Warning: operational notice\n'
         with self.assertRaises(InvalidAgentResponse):
             parse_team_conversation_reply(actual_prefix+payload,RoleId.REVIEW)
-        print('CONFIRMED: observed Hermes warning corrupts an otherwise valid response')
 
     def test_tool_round_replaces_earlier_file_evidence(self):
         class Tools:

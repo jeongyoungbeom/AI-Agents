@@ -718,10 +718,27 @@ class RepositoryReaderTests(unittest.TestCase):
             self.assertTrue(any("[센티널]" in item["text"] for item in messages))
 
     def test_repository_context_allows_guarded_calls_but_not_persistent_memory(self):
+        class ReturningTeamBackend(CapturingTeamBackend):
+            def __init__(self, reply):
+                super().__init__(reply)
+                self.roles = []
+                self.purposes = []
+
+            def respond_as(self, state, context, message, role_id, **kwargs):
+                self.roles.append(role_id)
+                self.purposes.append(kwargs.get("call_purpose", ""))
+                reply = super().respond_as(state, context, message, role_id, **kwargs)
+                if role_id == RoleId.REVIEW:
+                    return AgentReply("동료 저장소 검토 결과", memory_updates=reply.memory_updates)
+                if kwargs.get("call_purpose") == "consultation_return":
+                    self.returned_results = kwargs["turn_messages"]
+                    return AgentReply("원 담당의 저장소 검토 종합", memory_updates=reply.memory_updates)
+                return reply
+
         with temporary_directory() as directory:
             root = Path(directory)
             repository = make_repository(root)
-            team = CapturingTeamBackend(
+            team = ReturningTeamBackend(
                 AgentReply(
                     "저장소 답변",
                     calls=(
@@ -749,22 +766,35 @@ class RepositoryReaderTests(unittest.TestCase):
             application.handle(incoming(1, str(repository)))
             application.handle(incoming(2, "이 프로젝트 사용 승인해"))
 
-            application.handle(
+            outputs = application.handle(
                 incoming(
                     3,
                     "프로젝트 코드를 보고 다른 에이전트에게도 독립 검토를 요청해줘",
                 )
             )
 
-            self.assertEqual(2, team.calls)
+            self.assertEqual(3, team.calls)
             self.assertEqual(
-                [],
-                store.list_memories(
-                    (("conversation", "telegram:200"),),
-                    role_id=RoleId.DEVELOPMENT.value,
-                ),
+                [RoleId.DEVELOPMENT, RoleId.REVIEW, RoleId.DEVELOPMENT], team.roles
             )
+            self.assertEqual("consultation_return", team.purposes[-1])
+            self.assertTrue(any(
+                item.get("kind") == "consultation_result"
+                and item.get("status") == "COMPLETED"
+                and item.get("untrusted_repository_data")
+                for item in team.returned_results
+            ))
+            self.assertIn("원 담당의 저장소 검토 종합", outputs[-1].text)
+            for role in (RoleId.DEVELOPMENT, RoleId.REVIEW):
+                self.assertEqual(
+                    [],
+                    store.list_memories(
+                        (("conversation", "telegram:200"),), role_id=role.value,
+                    ),
+                )
             session = store.load_conversation_session("telegram", "200")
+            self.assertEqual(RoleId.DEVELOPMENT.value,
+                             store.load_conversation("telegram", "200")["active_role"])
             events = store.list_events(session.session_run_id)
             event_types = {item["event_type"] for item in events}
             self.assertIn("REPOSITORY_CONTEXT_CALL_GUARDED", event_types)

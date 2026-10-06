@@ -4,7 +4,9 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
+from app.contracts.outcomes import RequestOutcome, RequestResult
 from app.gateway.core.conversation import ConversationCancelled, DialogueRouter
 from app.gateway.core.models import IncomingMessage, OutgoingMessage
 from app.services.logging.redaction import SecretRedactor
@@ -161,19 +163,33 @@ class ConversationWorker:
                     message.conversation_id,
                     message.external_message_id,
                 )
-                if not cached:
-                    raise RuntimeError("resumed conversation has no durable response")
-                outgoing = tuple(
-                    OutgoingMessage(
-                        message.channel,
-                        message.conversation_id,
-                        text,
-                        reply_to=message.external_message_id,
+                if cached:
+                    outgoing = tuple(
+                        OutgoingMessage(
+                            message.channel,
+                            message.conversation_id,
+                            text,
+                            reply_to=message.external_message_id,
+                        )
+                        for text in cached
                     )
-                    for text in cached
-                )
+                    result = self.store.conversation_result(
+                        message.channel, message.conversation_id, message.external_message_id,
+                    ) or RequestResult(RequestOutcome.FAILED, "OUTCOME_UNKNOWN", None, None)
+                    if result.reason == "RUNNING":
+                        result = replace(result, outcome=RequestOutcome.PARTIAL, reason="INTERRUPTED")
+                else:
+                    message = replace(message, metadata={**message.metadata, "model_cache_replay": True})
+                    routed = self.router.route_result(message, cancelled=cancelled)
+                    outgoing, result = routed.messages, routed.result
             else:
-                outgoing = self.router.route(message, cancelled=cancelled)
+                route_result = getattr(self.router, "route_result", None)
+                if callable(route_result):
+                    routed = route_result(message, cancelled=cancelled)
+                    outgoing, result = routed.messages, routed.result
+                else:
+                    outgoing = self.router.route(message, cancelled=cancelled)
+                    result = RequestResult(RequestOutcome.SUCCESS)
             if lease_lost.is_set():
                 raise RuntimeError("conversation job lease was lost")
             prepared = tuple(
@@ -181,23 +197,32 @@ class ConversationWorker:
                 for item in outgoing
                 for part in self.message_preparer(item)
             )
+            target_run = message.metadata.get('gateway_run_id')
+            binding = self.store.load_conversation(message.channel, message.conversation_id)
+            if target_run and (not binding or binding['run_id'] != target_run):
+                prepared = ()
+                result = RequestResult(RequestOutcome.CANCELLED, 'SUPERSEDED_TASK')
             if self.store.conversation_job_cancel_requested(job_id):
                 self.router.cancel_conversation_progress(message)
                 prepared = ()
                 status = "CANCELLED"
             else:
                 status = "COMPLETED"
-            self.store.finish_conversation_job(
-                job_id,
-                self.instance_id,
-                status,
-                [self._outbound_dict(item) for item in prepared],
-            )
-            if status in {"COMPLETED", "CANCELLED"}:
-                self.router.complete_conversation_progress(message)
+            with self.store.transaction():
+                self.store.finish_conversation_job(
+                    job_id, self.instance_id, status,
+                    [self._outbound_dict(item) for item in prepared], result=result,
+                )
+                status = self.store.conversation_job(job_id)["status"]
+                result = self.store.conversation_result(
+                    message.channel, message.conversation_id, message.external_message_id,
+                )
+            if status == "CANCELLED":
+                self.router.cancel_conversation_progress(message)
+            self.router.complete_conversation_progress(message)
             self.error_sink(
                 f"대화 작업 종료 job={job_id} status={status} "
-                f"attempt={job['attempts']} responses={len(prepared)}"
+                f"attempt={job['attempts']} outcome={result.outcome.value} responses={len(prepared)}"
             )
         except ConversationCancelled as exc:
             self.router.cancel_conversation_progress(message)
@@ -223,12 +248,16 @@ class ConversationWorker:
                 reply_to=message.external_message_id,
             )
             try:
+                previous = self.store.conversation_result(
+                    message.channel, message.conversation_id, message.external_message_id,
+                ) or RequestResult(RequestOutcome.FAILED)
                 self.store.finish_conversation_job(
                     job_id,
                     self.instance_id,
                     "NEEDS_ATTENTION",
                     [self._outbound_dict(notice)],
                     safe_error,
+                    result=replace(previous, outcome=RequestOutcome.FAILED, reason="PROCESSING_FAILED"),
                 )
             except Exception as finish_exc:
                 self.error_sink(
@@ -260,6 +289,18 @@ class ConversationWorker:
             channel = str(job["channel"])
             conversation_id = str(job["conversation_id"])
             external_message_id = str(job["external_message_id"])
+            input_id = job['message'].get('metadata', {}).get('gateway_execution_input')
+            entry = self.store.execution_input(input_id) if input_id else None
+            if entry and entry['status'] != 'RECEIVED' and self.store.execution_input_is_current(entry):
+                self.store.requeue_conversation_job(channel, conversation_id, job_id=int(job['job_id']))
+            if getattr(self.router, "budget", None) is not None:
+                from app.gateway.core.governed_backend import GovernedTeamConversationBackend
+                message = IncomingMessage.from_dict(job["message"])
+                request_key = GovernedTeamConversationBackend.request_key(message)
+                for run_id, stage_id in self.store.interrupted_call_scopes(
+                    request_key
+                ):
+                    self.router.budget.recover_interrupted_calls(run_id, stage_id, request_key)
             cached = self.store.conversation_responses(
                 channel, conversation_id, external_message_id
             )

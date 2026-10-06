@@ -1,29 +1,69 @@
-# Local credentials and machine-specific configuration
-config/secrets.env
-config/*.env
+# Credentials and machine-specific configuration
+/config/*.env
 .env
 .env.*
 !*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Personal coding-agent instructions, skills, and session records
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+GEMINI.md
+.agents/
+.codex/
+.claude/
+.cursor/
+/skills/
+/.workflow/
+/reviews/
+/plans/*
+!/plans/example-plan.json
+
+# Local editors and operating-system files
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
 
 # Live state, backups, logs, and generated work
-data/*
-!data/README.md
-artifacts/
-backups/
-logs/
-test-tmp/
-
-# Hermes is a separate Git repository with local changes.
-runtime/
-hermes-home/
-
-# Python and local environments
-**/__pycache__/
-*.pyc
-**/.pytest_cache/
-.venv/
-venv/
+/data/*
+!/data/README.md
+/artifacts/
+/backups/
+/logs/
+/test-tmp/
+*.log
 *.db
 *.db-*
 *.sqlite
 *.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Hermes is maintained as a separate local Git repository
+/runtime/
+/hermes-home/
+
+# Python environments, caches, and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+/build/
+/dist/

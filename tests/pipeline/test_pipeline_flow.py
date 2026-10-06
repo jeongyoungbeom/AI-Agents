@@ -81,7 +81,7 @@ class PipelineFlowTests(unittest.TestCase):
             self.assertEqual(RunPhase.COMPLETED, store.load_run(run_id).phase)
             self.assertIn("PostgreSQL로 진행해줘", runner.prompts[-1])
 
-    def test_question_after_a_write_is_stopped_without_creating_a_resumable_question(self):
+    def test_question_after_a_write_preserves_changes_and_opens_a_resumable_question(self):
         class MutatingQuestionRunner(FakeRoleRunner):
             def run(self, *args, **kwargs):
                 role_id = args[2]
@@ -107,11 +107,14 @@ class PipelineFlowTests(unittest.TestCase):
 
             self.assertEqual(RunPhase.PAUSED, store.load_run(run_id).phase)
             self.assertEqual("NEEDS_ATTENTION", store.pipeline_job(run_id)["status"])
-            self.assertIsNone(store.open_execution_question_for_run(run_id))
+            self.assertIsNotNone(store.open_execution_question_for_run(run_id))
+            checkpoint = store.pipeline_workspace(run_id)
+            self.assertTrue(checkpoint['dirty_fingerprint'])
+            self.assertEqual('partial\n', (Path(checkpoint['worktree']['worktree_path']) / 'feature.txt').read_text(encoding='utf-8'))
             messages = "\n".join(
                 item["text"] for item in store.deliverable_outbound("telegram")
             )
-            self.assertIn("미커밋 파일 변경", messages)
+            self.assertIn("진행할까요?", messages)
     def test_progress_is_flushed_immediately_and_activity_is_reported(self):
         with temporary_directory() as directory:
             root = Path(directory)

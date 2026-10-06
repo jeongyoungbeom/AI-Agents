@@ -16,6 +16,7 @@ from app.gateway.core.models import (
     ProposedStage,
 )
 from app.services.repository import RepositoryToolRequest
+from app.services.message_intent import TaskIntent
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ def parse_team_conversation_reply(text: str, speaker: RoleId) -> AgentReply:
                     from_role=speaker,
                     to_role=target,
                     purpose=str(raw.get("purpose", "")).strip(),
+                    mode=raw.get("mode", "independent"),
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -156,12 +158,48 @@ def parse_team_conversation_reply(text: str, speaker: RoleId) -> AgentReply:
     if not message and not tools:
         raise InvalidAgentResponse("자유 대화 응답 message가 비어 있습니다.")
 
+    intent = value.get("intent", {})
+    if (not isinstance(intent, dict)
+        or not isinstance(intent.get("write_forbidden", False), bool)
+        or not isinstance(intent.get("question_purpose", ""), str)):
+        raise InvalidAgentResponse("intent와 write_forbidden 형식이 올바르지 않습니다.")
+    try:
+        task_intent = TaskIntent(intent.get("task_intent", "answer"))
+    except (ValueError, TypeError) as exc:
+        raise InvalidAgentResponse("알 수 없는 task_intent입니다.") from exc
+    if task_intent != TaskIntent.ANSWER and (tools or calls or updates):
+        raise InvalidAgentResponse("모드 전환과 조회·호출·기억 갱신을 함께 요청할 수 없습니다.")
+    questions = _strings(value.get("needs_user_input", []), "needs_user_input")
+    if len(questions) > 3 or (questions and (tools or calls or updates or task_intent != TaskIntent.ANSWER)):
+        raise InvalidAgentResponse("사용자 질문은 세 개까지이며 다른 행동과 함께 요청할 수 없습니다.")
+
     return AgentReply(
         text=message,
         calls=tuple(calls),
         memory_updates=tuple(updates),
         repository_tools=tuple(tools),
+        task_intent=task_intent,
+        write_forbidden=intent.get("write_forbidden", False),
+        question_purpose=intent.get("question_purpose", "")[:512],
+        needs_user_input=questions,
+        execution_intent=_execution_intent(value.get("execution_intent")),
     )
+
+
+def _execution_intent(value):
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or value.get('action') not in
+            {'question', 'supplement', 'redirect', 'test_first', 'scope_change'}):
+        raise InvalidAgentResponse('execution_intent action 형식이 올바르지 않습니다.')
+    paths = value.get('requested_scope', [])
+    if not isinstance(paths, list) or len(paths) > 32 or any(not isinstance(p, str) or not p.strip() for p in paths):
+        raise InvalidAgentResponse('execution_intent requested_scope 형식이 올바르지 않습니다.')
+    clarifies = value.get('clarifies_input_ids', [])
+    if (not isinstance(clarifies, list) or len(clarifies) > 32
+            or any(type(item) is not int or item <= 0 for item in clarifies)):
+        raise InvalidAgentResponse('execution_intent clarifies_input_ids 형식이 올바르지 않습니다.')
+    return {'action': value['action'], 'requested_scope': paths, 'clarifies_input_ids': clarifies}
 
 
 def parse_role_summary(text: str) -> RoleSummary:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import sqlite3
+import json
 from pathlib import Path
 
 from app.contracts import RoleId
@@ -22,6 +23,16 @@ from app.storage import StateStore
 
 from tests.gateway.support import build_application, future_expiry, temporary_directory
 from tests.gateway.test_conversation_foundation import incoming
+
+
+def batch_reply(context, summary):
+    if context.repository_context["phase"] == "SYNTHESIS":
+        return AgentReply(summary)
+    return AgentReply(json.dumps({"findings": [
+        {"path": item["path"], "start_line": item.get("start_line", 1),
+         "end_line": item.get("end_line", 1), "summary": summary}
+        for item in context.repository_context["documents"]
+    ]}, ensure_ascii=False))
 
 
 class RepositoryAnalysisPlanTests(unittest.TestCase):
@@ -96,11 +107,11 @@ class RepositoryAnalysisPlanTests(unittest.TestCase):
         source_batches = [batch for batch in analysis_batches if "source" in batch["categories"]]
         self.assertEqual([2, 1], [len(batch["paths"]) for batch in source_batches])
         self.assertEqual(
-            "category_not_selected",
-            next(item["reason"] for item in plan["not_selected"] if item["path"] == "assets/logo.bin"),
+            "binary_extension",
+            next(item["exclude_reason"] for item in plan["files"] if item["path"] == "assets/logo.bin"),
         )
 
-    def test_plan_marks_files_that_cannot_fit_context_instead_of_scheduling_them(self):
+    def test_plan_schedules_large_files_as_bounded_ranges(self):
         manifest = RepositorySnapshotManifest(
             "a" * 64,
             "b" * 40,
@@ -117,10 +128,10 @@ class RepositoryAnalysisPlanTests(unittest.TestCase):
             max_context_bytes=20_000,
         )
 
-        self.assertFalse(plan["files"][0]["eligible"])
-        self.assertEqual("context_size_limit", plan["files"][0]["exclude_reason"])
-        self.assertIn("CONTEXT_LIMIT", plan["partial_reasons"])
-        self.assertNotIn(
+        self.assertTrue(plan["files"][0]["eligible"])
+        self.assertEqual("", plan["files"][0]["exclude_reason"])
+        self.assertNotIn("CONTEXT_LIMIT", plan["partial_reasons"])
+        self.assertIn(
             "app/large.py", [path for batch in plan["batches"] for path in batch["paths"]]
         )
 
@@ -155,7 +166,7 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
                 pass
 
             def respond_as(self, *_args, **_kwargs):
-                return AgentReply("확인한 코드의 역할을 요약했습니다.")
+                return batch_reply(_args[1], "확인한 코드의 역할을 요약했습니다.")
 
         with temporary_directory() as directory:
             root = Path(directory)
@@ -353,10 +364,12 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
 
             proposal = application.handle(incoming(2, "전체 코드와 전체 테스트 전략을 분석해줘"))
             self.assertIn("전체 코드 감사 제안", proposal[0].text)
+            self.assertEqual("waiting_user", store.conversation_result("telegram", "200", incoming(2, "전체 코드와 전체 테스트 전략을 분석해줘").external_message_id).outcome.value)
             self.assertIsNone(store.repository_analysis_summary("telegram", "200"))
             reply = application.handle(incoming(3, "전체 감사 시작해"))
 
             self.assertIn("장기 저장소 분석을 등록", reply[0].text)
+            self.assertEqual("partial", store.conversation_result("telegram", "200", incoming(3, "전체 감사 시작해").external_message_id).outcome.value)
             analysis = store.repository_analysis_summary("telegram", "200")
             self.assertIsNotNone(analysis)
             assert analysis is not None
@@ -402,11 +415,16 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
 
             def respond_as(self, _state, _context, message, role_id, **_kwargs):
                 self.calls.append((message.text, role_id, _context.repository_context))
-                return AgentReply("확인한 파일의 역할과 테스트 관점을 요약했습니다.")
+                return batch_reply(_context, "확인한 파일의 역할과 테스트 관점을 요약했습니다.")
 
         with temporary_directory() as directory:
             root = Path(directory)
             store = StateStore(root / "state.db")
+            session_run_id = "RUN-S03-ANALYSIS-SESSION"
+            RunStateMachine(store).create_run(session_run_id)
+            store.create_conversation_session(
+                "telegram", "200", "100", session_run_id, RoleId.DEVELOPMENT.value,
+            )
             request = RepositoryAnalysisRequest.create(
                 channel="telegram",
                 conversation_id="200",
@@ -465,6 +483,10 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
             )
             delivered = store.deliverable_outbound("telegram")
             self.assertTrue(any("장기 저장소 분석 · 완료" in item["text"] for item in delivered))
+            linked = [item for item in store.list_messages(session_run_id)
+                      if item["kind"] == "analysis_result"]
+            self.assertEqual(1, len(linked))
+            self.assertEqual(request.analysis_id, linked[0]["data"]["analysis_id"])
 
     def test_restart_marks_an_inflight_model_call_for_attention_without_replaying_it(self):
         with temporary_directory() as directory:
@@ -647,7 +669,7 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
 
             def respond_as(self, _state, context, _message, _role_id, **_kwargs):
                 self.calls.append(context.repository_context)
-                return AgentReply("저장된 근거에서 테스트 설정과 실행 흐름을 확인했습니다.")
+                return batch_reply(context, "저장된 근거에서 테스트 설정과 실행 흐름을 확인했습니다.")
 
         with temporary_directory() as directory:
             root = Path(directory)
@@ -689,7 +711,7 @@ class RepositoryAnalysisRequestTests(unittest.TestCase):
             response = store.deliverable_outbound("telegram")[-1]["text"]
             self.assertEqual("PARTIAL_COMPLETED", analysis["status"])
             self.assertEqual("BATCH_LIMIT", analysis["stop_reason"])
-            self.assertTrue(analysis["plan"]["unprocessed_paths"])
+            self.assertTrue(any(batch["paths"] for batch in analysis["remaining"]))
             self.assertGreaterEqual(len(team.calls), 2)
             self.assertIn("저장된 근거에서 테스트 설정", response)
             self.assertIn("계획됐지만 미처리", response)

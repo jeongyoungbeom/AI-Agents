@@ -1,666 +1,315 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 from app.contracts import RoleId, TokenUsage
-from app.services.budget import (
-    BudgetExceeded,
-    BudgetManager,
-    BudgetReservation,
-    conservative_prompt_tokens,
-)
+from app.contracts.models import utc_now
+from app.services.budget import BudgetExceeded, BudgetManager, conservative_prompt_tokens
 from app.services.context import ContextBundle
 from app.services.git import GitRepositoryError
 from app.services.hermes import HermesCancelled, HermesExecutionError
 from app.services.logging.redaction import SecretRedactor
+from app.storage import StateStore
 
-from .models import (
-    AgentReply,
-    IncomingMessage,
-    TeamConversationBatchResult,
-    TeamConversationRequest,
-)
 from .errors import InvalidAgentResponse
-from .ports import AgentConversationBackend, TeamConversationBackend
+from .models import AgentReply, TeamConversationBatchResult, TeamConversationRequest
 
 
-class GovernedAgentBackend:
-    """모든 대화형 모델 호출에 예산 기록과 제한된 기술 재시도를 강제한다."""
+class _GovernedCalls:
+    """실행 시도·사용량·결과를 함께 확정하는 대화 호출 경계."""
 
-    def __init__(
-        self,
-        delegate: AgentConversationBackend,
-        budget: BudgetManager,
-        *,
-        response_reserve_tokens: int = 1024,
-    ):
+    supports_cancellation = True
+    reserves_before_execution = True
+    planning = False
+
+    def __init__(self, delegate, budget: BudgetManager, *, response_reserve_tokens: int = 1024):
         if response_reserve_tokens < 1:
             raise ValueError("response reserve must be positive")
         self.delegate = delegate
         self.budget = budget
         self.response_reserve_tokens = response_reserve_tokens
         self.redactor = SecretRedactor()
-        self.supports_cancellation = True
 
-    def respond(
-        self,
-        state,
-        context: ContextBundle,
-        message: IncomingMessage,
-        *,
-        cancelled=None,
-    ) -> AgentReply:
-        stage_id = f"stage-{state.stage_index + 1:03d}"
-        input_estimate = self._input_upper_bound(state, context, message)
-        while True:
-            reservation = self._reserve(state, stage_id, input_estimate)
-            try:
-                reply = self._invoke_delegate(
-                    state, context, message, cancelled=cancelled
-                )
-                break
-            except HermesCancelled:
-                self.budget.release_reservation(reservation)
-                raise
-            except GitRepositoryError:
-                # 읽기 전용 역할의 변경 감지는 안전 위반이므로 자동 재실행하지 않는다.
-                self.budget.release_reservation(reservation)
-                raise
-            except Exception as exc:
-                self._record_execution_failure_usage(
-                    state, stage_id, exc, reservation
-                )
-                if not self.budget.can_retry(
-                    state.run_id, stage_id, "technical_error"
-                ):
-                    raise
-                self._require_budget(state, stage_id, input_estimate)
-                self.budget.record_retry(
-                    state.run_id,
-                    stage_id,
-                    "technical_error",
-                    self.redactor.text(type(exc).__name__),
-                )
+    @staticmethod
+    def _stage_id(message) -> str:
+        digest = hashlib.sha256(message.external_message_id.encode("utf-8")).hexdigest()[:12]
+        return f"chat-{digest}"
 
-        usage = reply.usage
-        if usage.total_tokens == 0:
-            usage = TokenUsage(
-                input_tokens=input_estimate,
-                output_tokens=max(1, (len(reply.text) + 3) // 4),
-                estimated=True,
-            )
-        self.budget.record_usage(
-            state.run_id,
-            stage_id,
-            RoleId.DEVELOPMENT.value,
-            "conversation",
-            usage,
-            reservation=reservation,
-        )
-        return reply
+    @staticmethod
+    def request_key(message):
+        return StateStore.model_request_key(message.channel, message.conversation_id, message.external_message_id)
 
-    def _reserve(self, state, stage_id: str, input_estimate: int) -> BudgetReservation:
-        return self.budget.reserve(
-            state.run_id,
-            stage_id,
-            RoleId.DEVELOPMENT.value,
-            "conversation",
-            input_estimate + self.response_reserve_tokens,
-        )
+    def _stage(self, state, message):
+        return f"stage-{state.stage_index + 1:03d}" if self.planning else self._stage_id(message)
 
-    def _input_upper_bound(
-        self, state, context: ContextBundle, message: IncomingMessage
-    ) -> int:
+    @staticmethod
+    def _category(request):
+        return "repository_analysis" if request.call_purpose.startswith("repository_analysis_") else "conversation"
+
+    @staticmethod
+    def _completion(request):
+        return request.call_purpose in {"repository_analysis_synthesis", "agent_loop_final",
+                                        "consultation_return", "consultation_final"}
+
+    def _input_upper_bound(self, state, context, message, role_id, turn_messages=(),
+                           call_purpose="", caller_role=None, call_index=1):
         estimator = getattr(self.delegate, "prompt_token_upper_bound", None)
         if callable(estimator):
-            tokens = int(estimator(state, context, message))
+            args = (state, context, message) if self.planning else (state, context, message, role_id)
+            kwargs = {} if self.planning else dict(caller_role=caller_role, call_purpose=call_purpose,
+                                                   turn_messages=turn_messages, call_index=call_index)
+            tokens = int(estimator(*args, **kwargs))
         else:
-            tokens = conservative_prompt_tokens(
-                f"{context.to_dict()}\n{message.text}"
-            )
+            tokens = conservative_prompt_tokens(f"{context.to_dict()}\n{message.text}\n{call_purpose}\n{turn_messages}")
         if tokens < 1:
             raise ValueError("model prompt token upper bound must be positive")
         return tokens + self.budget.policy.provider_input_overhead_tokens
 
-    def _invoke_delegate(
-        self, state, context: ContextBundle, message: IncomingMessage, *, cancelled=None
-    ) -> AgentReply:
-        kwargs = {}
-        if getattr(self.delegate, "supports_output_token_limit", False):
-            kwargs["max_output_tokens"] = self.response_reserve_tokens
-        if getattr(self.delegate, "supports_cancellation", False):
-            kwargs["cancelled"] = cancelled
-        return self.delegate.respond(state, context, message, **kwargs)
+    def _estimate(self, state, message, request):
+        tokens = self._input_upper_bound(state, request.context, message, request.role_id,
+                                        request.turn_messages, request.call_purpose,
+                                        request.caller_role, request.call_index)
+        estimator = getattr(self.delegate, "invocation_token_estimate", None)
+        total = int(estimator(tokens, self.response_reserve_tokens)) if callable(estimator) else tokens + self.response_reserve_tokens
+        if total < tokens:
+            raise ValueError("invocation estimate cannot be smaller than its input")
+        return tokens, total
 
-    def _require_budget(self, state, stage_id: str, input_estimate: int) -> None:
-        decision = self.budget.can_spend(
-            state.run_id,
-            stage_id,
-            input_estimate + self.response_reserve_tokens,
-            category="conversation",
-        )
-        if not decision.allowed:
-            raise BudgetExceeded(decision.reason)
+    def _logical_id(self, state, message, request):
+        # worker의 재전송 제약은 원래 모델 입력을 바꾸지 않는다.
+        message = replace(message, metadata={key: value for key, value in message.metadata.items()
+                                            if key != "model_cache_replay"})
+        fingerprint = getattr(self.delegate, "call_input_fingerprint", None)
+        kwargs = dict(caller_role=request.caller_role, call_purpose=request.call_purpose,
+                      turn_messages=request.turn_messages, call_index=request.call_index)
+        actual_prompt = (fingerprint(state, request.context, message) if self.planning
+                         else fingerprint(state, request.context, message, request.role_id, **kwargs)) if callable(fingerprint) else ""
+        payload = [state.run_id, message.to_dict(), request.role_id.value,
+                   request.context.to_dict(), request.caller_role, request.call_purpose,
+                   request.turn_messages, request.call_index, self.response_reserve_tokens, actual_prompt]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
-    def _record_execution_failure_usage(
-        self,
-        state,
-        stage_id: str,
-        error: Exception,
-        reservation: BudgetReservation,
-    ) -> None:
-        if isinstance(error, HermesExecutionError) and error.usage.total_tokens:
-            self.budget.record_usage(
-                state.run_id,
-                stage_id,
-                RoleId.DEVELOPMENT.value,
-                "conversation",
-                error.usage,
-                reservation=reservation,
-            )
-        else:
-            self.budget.release_reservation(reservation)
-
-
-class GovernedTeamConversationBackend:
-    """자유 대화의 역할별 예산, 사용량, 형식/기술 재시도를 강제한다."""
-
-    def __init__(
-        self,
-        delegate: TeamConversationBackend,
-        budget: BudgetManager,
-        *,
-        response_reserve_tokens: int = 1024,
-    ):
-        if response_reserve_tokens < 1:
-            raise ValueError("response reserve must be positive")
-        self.delegate = delegate
-        self.budget = budget
-        self.response_reserve_tokens = response_reserve_tokens
-        self.redactor = SecretRedactor()
-        self.supports_cancellation = True
-
-    def preflight(
-        self,
-        state,
-        context: ContextBundle,
-        message: IncomingMessage,
-        reply_count: int,
-    ) -> None:
-        if reply_count < 1:
-            raise ValueError("reply_count must be positive")
-        per_reply = self._input_upper_bound(
-            state, context, message, RoleId.DEVELOPMENT, (), "", None, 1
-        )
-        projected = (per_reply + self.response_reserve_tokens) * reply_count
-        decision = self.budget.can_spend(
-            state.run_id,
-            self._stage_id(message),
-            projected,
-            category="conversation",
-        )
-        if not decision.allowed:
-            raise BudgetExceeded(decision.reason)
-
-    def respond_as(
-        self,
-        state,
-        context: ContextBundle,
-        message: IncomingMessage,
-        role_id: RoleId,
-        *,
-        caller_role: RoleId | None = None,
-        call_purpose: str = "",
-        turn_messages: tuple[dict, ...] = (),
-        call_index: int = 1,
-        cancelled=None,
-    ) -> AgentReply:
-        stage_id = self._stage_id(message)
-        budget_category = (
-            "repository_analysis"
-            if call_purpose.startswith("repository_analysis_")
-            else "conversation"
-        )
-        use_completion_reserve = call_purpose == "repository_analysis_synthesis"
-        input_estimate = self._input_upper_bound(
-            state,
-            context,
-            message,
-            role_id,
-            turn_messages,
-            call_purpose,
-            caller_role,
-            call_index,
-        )
-        while True:
-            reservation = self._reserve(
-                state,
-                stage_id,
-                role_id,
-                input_estimate,
-                use_completion_reserve=use_completion_reserve,
-                category=budget_category,
-            )
+    def _prepare(self, state, message, request, logical_id, attempt):
+        store = self.budget.store
+        call_id = f"{logical_id}:{attempt}"
+        with self.budget.transaction():
+            completed = store.completed_model_call(logical_id)
+            if completed:
+                result = AgentReply.from_dict(json.loads(completed["result_json"]))
+                return replace(result, metadata={**result.metadata, "cached_call": True})
+            if message.metadata.get("model_cache_replay"):
+                return HermesExecutionError("현재 입력과 일치하는 완료 결과가 없어 재전송을 중단했습니다.",
+                                            category="call_state", retryable=False)
+            if store.model_call(call_id):
+                return HermesExecutionError("같은 호출이 실행 중이거나 이미 중단됐습니다. 저장된 상태를 확인해야 합니다.",
+                                            category="call_state", retryable=False)
+            input_tokens, estimated_total = self._estimate(state, message, request)
             try:
-                kwargs = {
-                    "caller_role": caller_role,
-                    "call_purpose": call_purpose,
-                    "turn_messages": turn_messages,
-                    "call_index": call_index,
-                }
-                if getattr(self.delegate, "supports_output_token_limit", False):
-                    kwargs["max_output_tokens"] = self.response_reserve_tokens
-                if getattr(self.delegate, "supports_cancellation", False):
-                    kwargs["cancelled"] = cancelled
-                reply = self.delegate.respond_as(
-                    state,
-                    context,
-                    message,
-                    role_id,
-                    **kwargs,
-                )
-                break
-            except HermesCancelled:
-                self.budget.release_reservation(reservation)
-                raise
-            except InvalidAgentResponse as exc:
-                self._record_failure_usage(
-                    state, stage_id, role_id, exc, reservation, category=budget_category
-                )
-                if not self.budget.can_retry(state.run_id, stage_id, "invalid_response"):
-                    raise
-                self._require_budget(
-                    state,
-                    stage_id,
-                    input_estimate,
-                    use_completion_reserve=use_completion_reserve,
-                    category=budget_category,
-                )
-                self.budget.record_retry(
-                    state.run_id,
-                    stage_id,
-                    "invalid_response",
-                    self.redactor.text(type(exc).__name__),
-                )
-                call_index += 1
-            except GitRepositoryError:
-                self.budget.release_reservation(reservation)
-                raise
-            except Exception as exc:
-                self._record_failure_usage(
-                    state, stage_id, role_id, exc, reservation, category=budget_category
-                )
-                if not self.budget.can_retry(state.run_id, stage_id, "technical_error"):
-                    raise
-                self._require_budget(
-                    state,
-                    stage_id,
-                    input_estimate,
-                    use_completion_reserve=use_completion_reserve,
-                    category=budget_category,
-                )
-                self.budget.record_retry(
-                    state.run_id,
-                    stage_id,
-                    "technical_error",
-                    self.redactor.text(type(exc).__name__),
-                )
-                call_index += 1
-
-        return self._record_success(
-            state,
-            stage_id,
-            role_id,
-            reply,
-            input_estimate,
-            reservation,
-            category=budget_category,
-        )
-
-    def respond_batch(
-        self,
-        state,
-        message: IncomingMessage,
-        requests: tuple[TeamConversationRequest, ...],
-        *,
-        max_workers: int,
-        max_model_calls: int,
-        cancelled=None,
-    ) -> TeamConversationBatchResult:
-        """모델 실행만 병렬화하고 예산 원장은 호출 스레드에서 순서대로 기록한다."""
-        if not requests:
-            return TeamConversationBatchResult((), 0)
-        if max_workers < 1:
-            raise ValueError("max_workers must be positive")
-        if max_model_calls < len(requests):
-            raise ValueError("max_model_calls cannot be smaller than request count")
-        stage_id = self._stage_id(message)
-        outcomes: list[AgentReply | Exception | None] = [None] * len(requests)
-        runnable: list[tuple[int, TeamConversationRequest, int, BudgetReservation]] = []
-        for index, request in enumerate(requests):
-            input_estimate = self._input_upper_bound(
-                state,
-                request.context,
-                message,
-                request.role_id,
-                request.turn_messages,
-                request.call_purpose,
-                request.caller_role,
-                request.call_index,
-            )
-            try:
-                reservation = self._reserve(
-                    state, stage_id, request.role_id, input_estimate
-                )
+                reservation = self.budget.reserve(state.run_id, self._stage(state, message),
+                    request.role_id.value, self._category(request), estimated_total,
+                    use_completion_reserve=self._completion(request),
+                    completion_allowance_tokens=estimated_total if request.reserve_final_answer else 0)
             except BudgetExceeded as exc:
-                outcomes[index] = exc
-            else:
-                runnable.append((index, request, input_estimate, reservation))
+                return exc
+            store.create_model_call(call_id, logical_id, state.run_id, self._stage(state, message),
+                                    request.role_id.value, self._category(request), reservation.reservation_id,
+                                    self.request_key(message))
+            if not self.planning:
+                store.append_event(state.run_id, utc_now(), "CHAT_MODEL_INPUT_SAVED",
+                    "완료 결과 복구용 원래 호출 입력을 보존했습니다.", role_id=request.role_id.value,
+                    data={"logical_id": logical_id, "request_key": self.request_key(message),
+                          "context": request.context.to_dict(), "caller_role": request.caller_role,
+                          "call_purpose": request.call_purpose, "turn_messages": request.turn_messages,
+                          "call_index": request.call_index})
+        return call_id, reservation, input_tokens
 
-        if runnable:
-            with ThreadPoolExecutor(
-                max_workers=min(max_workers, len(runnable)),
-                thread_name_prefix="ai-agents-governed-chat",
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        self._invoke, state, message, request, cancelled=cancelled
-                    )
-                    for _index, request, _estimate, _reservation in runnable
-                ]
-                raw = [future.result() for future in futures]
-
-            # 세 초기 호출이 이미 소비한 사용량을 모두 먼저 반영해야, 어느 역할의
-            # 재시도도 아직 기록하지 않은 다른 역할의 사용량을 우회하지 않는다.
-            for (index, request, input_estimate, reservation), outcome in zip(
-                runnable, raw, strict=True
-            ):
-                outcomes[index] = self._record_initial_outcome(
-                    state,
-                    stage_id,
-                    request,
-                    input_estimate,
-                    outcome,
-                    reservation,
-                )
-            model_calls = len(runnable)
-            next_call_index = max(request.call_index for request in requests) + 1
-            for index, request, input_estimate, _reservation in runnable:
-                outcome = outcomes[index]
-                if not isinstance(outcome, Exception):
-                    continue
-                resolved, used_calls, next_call_index = self._resolve_batch_outcome(
-                    state,
-                    message,
-                    stage_id,
-                    request,
-                    input_estimate,
-                    outcome,
-                    remaining_model_calls=max_model_calls - model_calls,
-                    next_call_index=next_call_index,
-                    cancelled=cancelled,
-                )
-                outcomes[index] = resolved
-                model_calls += used_calls
-        else:
-            model_calls = 0
-        return TeamConversationBatchResult(
-            tuple(
-                outcome
-                if outcome is not None
-                else RuntimeError("parallel conversation result is missing")
-                for outcome in outcomes
-            ),
-            model_calls,
-        )
-
-    def _record_initial_outcome(
-        self,
-        state,
-        stage_id: str,
-        request: TeamConversationRequest,
-        input_estimate: int,
-        outcome: AgentReply | Exception,
-        reservation: BudgetReservation,
-    ) -> AgentReply | Exception:
-        if isinstance(outcome, AgentReply):
-            return self._record_success(
-                state, stage_id, request.role_id, outcome, input_estimate, reservation
-            )
-        self._record_failure_usage(
-            state, stage_id, request.role_id, outcome, reservation
-        )
-        return outcome
-
-    def _resolve_batch_outcome(
-        self,
-        state,
-        message: IncomingMessage,
-        stage_id: str,
-        request: TeamConversationRequest,
-        input_estimate: int,
-        outcome: AgentReply | Exception,
-        *,
-        remaining_model_calls: int,
-        next_call_index: int,
-        cancelled=None,
-    ) -> tuple[AgentReply | Exception, int, int]:
-        current = outcome
-        used_calls = 0
-        while isinstance(current, Exception):
-            if isinstance(current, HermesCancelled):
-                return current, used_calls, next_call_index
-            if isinstance(current, InvalidAgentResponse):
-                category = "invalid_response"
-            elif isinstance(current, GitRepositoryError):
-                return current, used_calls, next_call_index
-            else:
-                category = "technical_error"
-            if not self.budget.can_retry(state.run_id, stage_id, category):
-                return current, used_calls, next_call_index
-            if used_calls >= remaining_model_calls:
-                return current, used_calls, next_call_index
-            try:
-                reservation = self._reserve(
-                    state, stage_id, request.role_id, input_estimate
-                )
-            except BudgetExceeded as exc:
-                return exc, used_calls, next_call_index
-            try:
-                self.budget.record_retry(
-                    state.run_id,
-                    stage_id,
-                    category,
-                    self.redactor.text(type(current).__name__),
-                )
-            except RuntimeError:
-                self.budget.release_reservation(reservation)
-                return current, used_calls, next_call_index
-            retry_request = replace(request, call_index=next_call_index)
-            next_call_index += 1
-            current = self._invoke(
-                state, message, retry_request, cancelled=cancelled
-            )
-            used_calls += 1
-            if isinstance(current, AgentReply):
-                current = self._record_success(
-                    state,
-                    stage_id,
-                    request.role_id,
-                    current,
-                    input_estimate,
-                    reservation,
-                )
-            else:
-                self._record_failure_usage(
-                    state, stage_id, request.role_id, current, reservation
-                )
-        return current, used_calls, next_call_index
-
-    def _record_failure_usage(
-        self,
-        state,
-        stage_id: str,
-        role_id: RoleId,
-        error: Exception,
-        reservation: BudgetReservation,
-        *,
-        category: str = "conversation",
-    ) -> None:
-        if isinstance(error, InvalidAgentResponse) and error.usage.total_tokens:
-            self.budget.record_usage(
-                state.run_id,
-                stage_id,
-                role_id.value,
-                category,
-                error.usage,
-                reservation=reservation,
-            )
-        elif isinstance(error, HermesExecutionError) and error.usage.total_tokens:
-            self.budget.record_usage(
-                state.run_id,
-                stage_id,
-                role_id.value,
-                category,
-                error.usage,
-                reservation=reservation,
-            )
-        else:
-            self.budget.release_reservation(reservation)
-
-    def _reserve(
-        self,
-        state,
-        stage_id: str,
-        role_id: RoleId,
-        input_estimate: int,
-        *,
-        use_completion_reserve: bool = False,
-        category: str = "conversation",
-    ) -> BudgetReservation:
-        return self.budget.reserve(
-            state.run_id,
-            stage_id,
-            role_id.value,
-            category,
-            input_estimate + self.response_reserve_tokens,
-            use_completion_reserve=use_completion_reserve,
-        )
-
-    def _require_budget(
-        self,
-        state,
-        stage_id: str,
-        input_estimate: int,
-        *,
-        use_completion_reserve: bool = False,
-        category: str = "conversation",
-    ) -> None:
-        decision = self.budget.can_spend(
-            state.run_id,
-            stage_id,
-            input_estimate + self.response_reserve_tokens,
-            category=category,
-            use_completion_reserve=use_completion_reserve,
-        )
-        if not decision.allowed:
-            raise BudgetExceeded(decision.reason)
-
-    def _invoke(
-        self,
-        state,
-        message: IncomingMessage,
-        request: TeamConversationRequest,
-        *,
-        cancelled=None,
-    ) -> AgentReply | Exception:
+    def _invoke(self, state, message, request, *, cancelled=None):
         try:
-            kwargs = {
-                "caller_role": request.caller_role,
-                "call_purpose": request.call_purpose,
-                "turn_messages": request.turn_messages,
-                "call_index": request.call_index,
-            }
+            if cancelled is not None and cancelled():
+                raise HermesCancelled("모델 시작 전에 취소했습니다.", category="startup")
+            kwargs = {} if self.planning else dict(caller_role=request.caller_role,
+                call_purpose=request.call_purpose, turn_messages=request.turn_messages, call_index=request.call_index)
             if getattr(self.delegate, "supports_output_token_limit", False):
                 kwargs["max_output_tokens"] = self.response_reserve_tokens
             if getattr(self.delegate, "supports_cancellation", False):
                 kwargs["cancelled"] = cancelled
-            return self.delegate.respond_as(
-                state,
-                request.context,
-                message,
-                request.role_id,
-                **kwargs,
-            )
+            if self.planning:
+                return self.delegate.respond(state, request.context, message, **kwargs)
+            return self.delegate.respond_as(state, request.context, message, request.role_id, **kwargs)
         except Exception as exc:
             return exc
 
-    def _record_success(
-        self,
-        state,
-        stage_id: str,
-        role_id: RoleId,
-        reply: AgentReply,
-        input_estimate: int,
-        reservation: BudgetReservation,
-        *,
-        category: str = "conversation",
-    ) -> AgentReply:
-        usage = reply.usage
-        if usage.total_tokens == 0:
-            usage = TokenUsage(
-                input_tokens=input_estimate,
-                output_tokens=max(1, (len(reply.text) + 3) // 4),
-                estimated=True,
-            )
-        self.budget.record_usage(
-            state.run_id,
-            stage_id,
-            role_id.value,
-            category,
-            usage,
-            reservation=reservation,
-        )
-        return replace(reply, usage=usage)
+    def _finish(self, state, message, request, prepared, outcome):
+        call_id, reservation, input_tokens = prepared
+        stage_id = self._stage(state, message)
+        usage = getattr(outcome, "usage", TokenUsage())
+        unknown = False
+        if isinstance(outcome, AgentReply):
+            if not usage.total_tokens:
+                usage = TokenUsage(input_tokens=input_tokens,
+                    output_tokens=max(1, (len(outcome.text) + 3) // 4), estimated=True)
+        elif getattr(outcome, "category", "") == "startup" or (
+            isinstance(outcome, GitRepositoryError) and not getattr(outcome, "invocation_started", False)
+        ):
+            usage = TokenUsage()
+        elif usage.estimated or not usage.total_tokens:
+            unknown = True
+            usage = TokenUsage(total_tokens=reservation.reserved_tokens, estimated=True)
+        overage = usage.total_tokens > reservation.reserved_tokens
+        if isinstance(outcome, AgentReply):
+            outcome = replace(outcome, usage=usage, metadata={**outcome.metadata,
+                "call_id": call_id, "usage_unit": "hermes_invocation", "budget_stop": overage})
+        with self.budget.transaction():
+            if usage.total_tokens:
+                self.budget.record_usage(state.run_id, stage_id, request.role_id.value,
+                                         self._category(request), usage, reservation=reservation)
+            else:
+                self.budget.release_reservation(reservation)
+            if unknown:
+                self.budget.store.append_event(state.run_id, utc_now(), "MODEL_USAGE_UNKNOWN",
+                    "호출 실패·취소의 실제 사용량을 확인하지 못해 예약 추정량을 기록했습니다.",
+                    stage_id=stage_id, role_id=request.role_id.value, data={"call_id": call_id})
+            self.budget.store.finish_model_call(call_id,
+                "COMPLETED" if isinstance(outcome, AgentReply) else "FAILED",
+                outcome.to_dict() if isinstance(outcome, AgentReply) else
+                {"error_type": type(outcome).__name__, "usage": usage.to_dict(),
+                 "error": self.redactor.text(str(outcome))[:500]})
+        return outcome
 
-    def _input_upper_bound(
-        self,
-        state,
-        context: ContextBundle,
-        message: IncomingMessage,
-        role_id: RoleId,
-        turn_messages: tuple[dict, ...],
-        call_purpose: str,
-        caller_role: RoleId | None,
-        call_index: int,
-    ) -> int:
-        estimator = getattr(self.delegate, "prompt_token_upper_bound", None)
-        if callable(estimator):
-            tokens = int(
-                estimator(
-                    state,
-                    context,
-                    message,
-                    role_id,
-                    caller_role=caller_role,
-                    call_purpose=call_purpose,
-                    turn_messages=turn_messages,
-                    call_index=call_index,
-                )
-            )
-        else:
-            tokens = conservative_prompt_tokens(
-                f"{context.to_dict()}\n{message.text}\n{call_purpose}\n{turn_messages}"
-            )
-        if tokens < 1:
-            raise ValueError("model prompt token upper bound must be positive")
-        return tokens + self.budget.policy.provider_input_overhead_tokens
+    def _retry_category(self, outcome):
+        if isinstance(outcome, (HermesCancelled, GitRepositoryError, BudgetExceeded)):
+            return None
+        if isinstance(outcome, HermesExecutionError) and not outcome.retryable:
+            return None
+        return "invalid_response" if isinstance(outcome, InvalidAgentResponse) else "technical_error"
 
-    @staticmethod
-    def _stage_id(message: IncomingMessage) -> str:
-        digest = hashlib.sha256(
-            message.external_message_id.encode("utf-8")
-        ).hexdigest()[:12]
-        return f"chat-{digest}"
+    def _resolve(self, state, message, request, logical_id, outcome, remaining, next_index, *, cancelled=None):
+        calls = 0
+        while isinstance(outcome, Exception) and calls < remaining:
+            category = self._retry_category(outcome)
+            stage_id = self._stage(state, message)
+            if category is None or not self.budget.can_retry(state.run_id, stage_id, category):
+                break
+            retry = replace(request, call_index=next_index)
+            prepared = self._prepare(state, message, retry, logical_id, next_index)
+            if not isinstance(prepared, tuple):
+                outcome = prepared
+                break
+            try:
+                self.budget.record_retry(state.run_id, stage_id, category, type(outcome).__name__)
+            except RuntimeError:
+                outcome = self._finish(state, message, retry, prepared,
+                    HermesCancelled("다른 호출이 재시도 여유를 사용했습니다.", category="startup"))
+                break
+            next_index += 1
+            calls += 1
+            outcome = self._finish(state, message, retry, prepared,
+                                   self._invoke(state, message, retry, cancelled=cancelled))
+        return outcome, calls, next_index
+
+
+class GovernedAgentBackend(_GovernedCalls):
+    """계획 실행도 시작 프롬프트가 아닌 Hermes 전체 invocation으로 정산한다."""
+    planning = True
+
+    def respond(self, state, context, message, *, cancelled=None):
+        request = TeamConversationRequest(RoleId.DEVELOPMENT, context)
+        logical_id = self._logical_id(state, message, request)
+        prepared = self._prepare(state, message, request, logical_id, 1)
+        outcome = (self._finish(state, message, request, prepared,
+                    self._invoke(state, message, request, cancelled=cancelled))
+                   if isinstance(prepared, tuple) else prepared)
+        outcome, _, _ = self._resolve(state, message, request, logical_id, outcome,
+            sum(self.budget.policy.retries.values()), 2, cancelled=cancelled)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class GovernedTeamConversationBackend(_GovernedCalls):
+    """조사·협업·종합을 같은 결과/비용 확정 경계로 실행한다."""
+
+    def replay_saved_requests(self, state, message):
+        """새 문맥이나 모델 호출 없이 같은 요청의 원래 입력과 완료 결과를 반환한다."""
+        store = self.budget.store
+        calls = store.model_calls_for_request(self.request_key(message))
+        inputs = {}
+        for event in store.list_events(state.run_id):
+            if (event["event_type"] == "CHAT_MODEL_INPUT_SAVED"
+                    and event["data"]["request_key"] == self.request_key(message)):
+                inputs.setdefault(event["data"]["logical_id"], event["data"])
+        results = []
+        for call in calls:
+            if call["status"] != "COMPLETED":
+                continue
+            saved = inputs.get(call["logical_id"])
+            if call["run_id"] != state.run_id or saved is None:
+                raise RuntimeError("같은 작업의 원래 호출 입력을 확인할 수 없습니다.")
+            context = dict(saved["context"])
+            for field in ("decisions", "memories", "recent_messages", "evidence"):
+                context[field] = tuple(context[field])
+            request = TeamConversationRequest(RoleId(call["role_id"]), ContextBundle(**context),
+                RoleId(saved["caller_role"]) if saved["caller_role"] else None,
+                saved["call_purpose"], tuple(saved["turn_messages"]), saved["call_index"])
+            if self._logical_id(state, message, request) != call["logical_id"]:
+                raise RuntimeError("원래 입력과 일치하지 않아 완료 결과 재전송을 중단했습니다.")
+            results.append((request, AgentReply.from_dict(json.loads(call["result_json"]))))
+        return tuple(results)
+
+    def preflight(self, state, context, message, reply_count):
+        if reply_count < 1:
+            raise ValueError("reply_count must be positive")
+        request = TeamConversationRequest(RoleId.DEVELOPMENT, context)
+        _, estimated = self._estimate(state, message, request)
+        decision = self.budget.can_spend(state.run_id, self._stage_id(message),
+                                        estimated * reply_count, category="conversation")
+        if not decision.allowed:
+            raise BudgetExceeded(decision.reason)
+
+    def respond_as(self, state, context, message, role_id, *, caller_role=None,
+                   call_purpose="", turn_messages=(), call_index=1, cancelled=None):
+        result = self.respond_batch(state, message,
+            (TeamConversationRequest(role_id, context, caller_role, call_purpose, turn_messages, call_index),),
+            max_workers=1, max_model_calls=1 + sum(self.budget.policy.retries.values()), cancelled=cancelled)
+        outcome = result.outcomes[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def respond_batch(self, state, message, requests, *, max_workers, max_model_calls, cancelled=None):
+        if not requests:
+            return TeamConversationBatchResult((), 0)
+        if max_workers < 1 or max_model_calls < len(requests):
+            raise ValueError("invalid worker or model call limit")
+        outcomes = [None] * len(requests)
+        runnable = []
+        for index, request in enumerate(requests):
+            logical_id = self._logical_id(state, message, request)
+            try:
+                prepared = self._prepare(state, message, request, logical_id, request.call_index)
+            except Exception as exc:
+                prepared = exc
+            if isinstance(prepared, tuple):
+                runnable.append((index, request, logical_id, prepared))
+            else:
+                outcomes[index] = prepared
+        if runnable:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(runnable)),
+                                    thread_name_prefix="ai-agents-governed-chat") as executor:
+                futures = [executor.submit(self._invoke, state, message, item[1], cancelled=cancelled)
+                           for item in runnable]
+                raw = [future.result() for future in futures]
+            # 처음 예약한 병렬 호출의 비용을 모두 확정한 뒤 재시도를 판단한다.
+            for (index, request, _, prepared), outcome in zip(runnable, raw, strict=True):
+                outcomes[index] = self._finish(state, message, request, prepared, outcome)
+        model_calls = len(runnable)
+        next_index = max(request.call_index for request in requests) + 1
+        for index, request, logical_id, _ in runnable:
+            outcome, calls, next_index = self._resolve(state, message, request, logical_id,
+                outcomes[index], max_model_calls - model_calls, next_index, cancelled=cancelled)
+            outcomes[index] = outcome
+            model_calls += calls
+        return TeamConversationBatchResult(tuple(outcomes), model_calls)

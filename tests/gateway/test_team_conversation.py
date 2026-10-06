@@ -8,10 +8,7 @@ from unittest.mock import patch
 
 from app.agents.parsing import InvalidAgentResponse, parse_team_conversation_reply
 from app.agents.prompts import team_conversation_prompt
-from app.agents.team_conversation_backend import (
-    NO_TOOLS_TOOLSET,
-    HermesTeamConversationBackend,
-)
+from app.agents.team_conversation_backend import HermesTeamConversationBackend
 from app.config import FoundationConfig, RoleConfig
 from app.contracts import RoleId, RunState, TokenUsage
 from app.gateway.core import (
@@ -27,7 +24,7 @@ from app.gateway.core import GovernedTeamConversationBackend
 from app.gateway.core.errors import InvalidAgentResponse as CoreInvalidAgentResponse
 from app.services.budget import BudgetExceeded, BudgetManager, BudgetPolicy
 from app.services.context import ContextBundle
-from app.services.hermes import HermesModelSettings, HermesResult
+from app.services.hermes import HermesExecutionError, HermesModelSettings, HermesResult
 from app.storage import StateStore
 from tests.gateway.support import (
     FakeRepositoryValidator,
@@ -181,7 +178,8 @@ class TeamConversationRoutingTests(unittest.TestCase):
                     for item in progress_updates
                 )
             )
-            self.assertIn("진행: 4/4", progress_updates[-1]["text"])
+            self.assertNotIn("4/4", progress_updates[-1]["text"])
+            self.assertIn("앱 호출 시도 1회 · 성공 1회", progress_updates[-1]["text"])
             self.assertIn("[센티널 · 완료]", progress_updates[-1]["text"])
             self.assertIn("마지막 진행:", progress_updates[-1]["text"])
             self.assertGreaterEqual(len(notifications), 3)
@@ -264,7 +262,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                [RoleId.REVIEW, RoleId.REVIEW, RoleId.DEVELOPMENT],
+                [RoleId.REVIEW, RoleId.REVIEW, RoleId.DEVELOPMENT, RoleId.REVIEW],
                 [item[0] for item in team.calls],
             )
             self.assertIsNone(team.calls[1][1])
@@ -272,7 +270,8 @@ class TeamConversationRoutingTests(unittest.TestCase):
             rendered = "\n".join(item.text for item in output)
             self.assertIn("[센티널]", rendered)
             self.assertIn("[센티널 → 빌더]", rendered)
-            self.assertIn("[빌더]", rendered)
+            self.assertNotIn("[빌더]\n", rendered)
+            self.assertIn("빌더가 테스트 방법", str(team.calls[-1][3]))
 
     def test_agents_call_each_other_in_any_direction_and_cycles_are_bounded(self):
         responses = [
@@ -288,10 +287,8 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 "센티널 의견",
                 calls=(AgentCallRequest(RoleId.REVIEW, RoleId.DEVELOPMENT, "설계 의도"),),
             ),
-            AgentReply(
-                "빌더 재답변",
-                calls=(AgentCallRequest(RoleId.DEVELOPMENT, RoleId.IMPROVEMENT, "반복 호출"),),
-            ),
+            AgentReply("피니셔 재답변"),
+            AgentReply("빌더 종합"),
         ]
         with temporary_directory() as directory:
             team = StaticTeamBackend(responses)
@@ -299,16 +296,17 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 Path(directory), object(), team_backend=team, max_auto_agent_replies=4
             )
 
-            output = application.handle(incoming(1, "빌더 생각은 어때?"))
+            output = application.handle(incoming(1, "빌더 생각은 어때? 다른 에이전트에게 물어봐"))
 
             self.assertEqual(
-                [RoleId.DEVELOPMENT, RoleId.IMPROVEMENT, RoleId.REVIEW, RoleId.DEVELOPMENT],
+                [RoleId.DEVELOPMENT, RoleId.IMPROVEMENT, RoleId.REVIEW, RoleId.IMPROVEMENT, RoleId.DEVELOPMENT],
                 [item[0] for item in team.calls],
             )
             rendered = "\n".join(item.text for item in output)
             self.assertIn("[빌더 → 피니셔]", rendered)
             self.assertIn("[피니셔 → 센티널]", rendered)
-            self.assertIn("[센티널 → 빌더]", rendered)
+            self.assertNotIn("[센티널 → 빌더]", rendered)
+            self.assertIn("CONSULTATION_CYCLE", rendered)
             self.assertNotIn("반복 호출", rendered)
 
     def test_repository_context_allows_a_guarded_cross_role_consultation(self):
@@ -358,7 +356,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                [RoleId.DEVELOPMENT, RoleId.REVIEW],
+                [RoleId.DEVELOPMENT, RoleId.REVIEW, RoleId.DEVELOPMENT],
                 [item[0] for item in team.calls],
             )
             self.assertEqual(RoleId.DEVELOPMENT, team.calls[1][1])
@@ -540,7 +538,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 )
                 self.assertIsNone(guarded, purpose)
 
-    def test_repository_derived_reply_is_excluded_from_later_normal_chat_context(self):
+    def test_repository_derived_reply_remains_attributed_in_later_chat_context(self):
         repository_context = {
             "source": "approved_committed_git_snapshot",
             "untrusted_repository_data": True,
@@ -559,13 +557,20 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 lambda *_args, **_kwargs: (contexts.pop(0), "")
             )
 
-            application.handle(incoming(1, "빌더가 코드 구조를 확인해줘"))
-            application.handle(incoming(2, "이제 일반적으로 요약해줘"))
+            application.handle(incoming(1, "D:\\projects\\sample"))
+            application.handle(incoming(2, "이 프로젝트 사용 승인해"))
+            application.handle(incoming(3, "빌더가 코드 구조를 확인해줘"))
+            application.handle(incoming(4, "이제 일반적으로 요약해줘"))
 
-            self.assertNotIn(
+            self.assertIn(
                 "저장소에서 유래한 답변",
-                [item["content"] for item in team.calls[-1][4].recent_messages],
+                "\n".join(item["content"] for item in team.calls[-1][4].recent_messages),
             )
+            self.assertTrue(any(
+                item["data"].get("untrusted_repository_data")
+                for item in team.calls[-1][4].recent_messages
+                if "저장소에서 유래한 답변" in item["content"]
+            ))
             binding = store.load_conversation("telegram", "200")
             messages = store.list_messages(binding["run_id"])
             self.assertTrue(
@@ -581,7 +586,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
             def respond_as(self, *args, **kwargs):
                 role_id = args[3]
                 reply = super().respond_as(*args, **kwargs)
-                if role_id == RoleId.DEVELOPMENT and kwargs["caller_role"] is None:
+                if role_id == RoleId.DEVELOPMENT and kwargs["caller_role"] is None and kwargs["call_purpose"] == "":
                     return AgentReply(
                         "빌더",
                         calls=(
@@ -600,10 +605,10 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 Path(directory), object(), team_backend=team, max_auto_agent_replies=4
             )
 
-            application.handle(incoming(1, "얘들아 다들 의견 줘"))
+            application.handle(incoming(1, "얘들아 다들 의견 줘. 필요하면 다른 에이전트에게 물어봐"))
 
             self.assertEqual([3], team.preflights)
-            self.assertEqual(4, len(team.calls))
+            self.assertEqual(5, len(team.calls))
 
     def test_group_first_replies_run_concurrently_with_stable_output_order(self):
         with temporary_directory() as directory:
@@ -646,7 +651,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
 
             self.assertEqual(2, len(team.calls))
             self.assertEqual((), team.calls[0][3])
-            self.assertEqual(1, len(team.calls[1][3]))
+            self.assertEqual((), team.calls[1][3])
             binding = store.load_conversation("telegram", "200")
             event_types = {
                 event["event_type"] for event in store.list_events(binding["run_id"])
@@ -695,7 +700,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
                     self.calls.append(
                         (role_id, caller_role, tuple(turn_messages), call_index)
                     )
-                if caller_role is None:
+                if caller_role is None and call_purpose == "":
                     self.barrier.wait(timeout=2)
                 calls = (
                     AgentCallRequest(
@@ -703,7 +708,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
                         RoleId.REVIEW,
                         "세 의견 종합",
                     ),
-                ) if role_id == RoleId.DEVELOPMENT and caller_role is None else ()
+                ) if role_id == RoleId.DEVELOPMENT and caller_role is None and call_purpose == "" else ()
                 return AgentReply(
                     f"{role_id.value} 답변",
                     calls=calls,
@@ -721,19 +726,17 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 response_reserve_tokens=1,
             )
 
-            application.handle(incoming(1, "셋 다 의견 줘"))
+            application.handle(incoming(1, "셋 다 의견 줘. 필요하면 다른 에이전트에게 물어봐"))
 
-            self.assertEqual(4, len(delegate.calls))
+            self.assertEqual(5, len(delegate.calls))
             followups = [item for item in delegate.calls if item[1] is not None]
             self.assertEqual(1, len(followups))
             role_id, caller_role, turn_messages, call_index = followups[0]
             self.assertEqual(RoleId.REVIEW, role_id)
             self.assertEqual(RoleId.DEVELOPMENT, caller_role)
-            self.assertEqual(3, len(turn_messages))
-            self.assertEqual(
-                {role.value for role in RoleId},
-                {item["role_id"] for item in turn_messages},
-            )
+            self.assertEqual(1, len(turn_messages))
+            self.assertEqual("consultation_request", turn_messages[0]["kind"])
+            self.assertEqual(RoleId.DEVELOPMENT, delegate.calls[-1][0])
             self.assertEqual(4, call_index)
 
     def test_parallel_usage_updates_are_serialized(self):
@@ -758,7 +761,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
             binding = store.load_conversation("telegram", "200")
             self.assertEqual(18, store.usage_total(binding["run_id"]))
 
-    def test_retry_uses_fourth_model_call_and_blocks_a_followup(self):
+    def test_retry_is_separate_from_role_followup_limit(self):
         class RetryThenCall:
             def __init__(self):
                 self.calls = []
@@ -791,7 +794,7 @@ class TeamConversationRoutingTests(unittest.TestCase):
                         RoleId.REVIEW,
                         "추가 검토",
                     ),
-                ) if role_id == RoleId.DEVELOPMENT else ()
+                ) if role_id == RoleId.DEVELOPMENT and call_purpose == "" else ()
                 return AgentReply(
                     f"{role_id.value} 정상",
                     calls=calls,
@@ -815,12 +818,12 @@ class TeamConversationRoutingTests(unittest.TestCase):
                 response_reserve_tokens=1,
             )
 
-            output = application.handle(incoming(1, "얘들아 의견 줘"))
+            output = application.handle(incoming(1, "얘들아 의견 줘. 필요하면 다른 에이전트에게 물어봐"))
 
-            self.assertEqual(4, len(delegate.calls))
-            self.assertEqual({1, 2, 3, 4}, {item[1] for item in delegate.calls})
-            self.assertTrue(all(item[2] is None for item in delegate.calls))
-            self.assertIn("메시지당 4회 제한", "\n".join(item.text for item in output))
+            self.assertEqual(6, len(delegate.calls))
+            self.assertEqual({1, 2, 3, 4, 5, 6}, {item[1] for item in delegate.calls})
+            self.assertEqual(RoleId.DEVELOPMENT, delegate.calls[-1][0])
+            self.assertNotIn("메시지당 4회 제한", "\n".join(item.text for item in output))
 
     def test_stable_memory_update_is_saved_for_the_next_turn(self):
         responses = [
@@ -946,6 +949,7 @@ class HermesTeamBackendTests(unittest.TestCase):
             class Runner:
                 class Settings:
                     conversation = HermesModelSettings("gpt-5.6-terra", "xhigh")
+                    provider = "openai-codex"
 
                 settings = Settings()
 
@@ -973,7 +977,8 @@ class HermesTeamBackendTests(unittest.TestCase):
 
             self.assertEqual(root / "data" / "conversation-runtime", args[3])
             self.assertFalse(kwargs["allow_writes"])
-            self.assertEqual(NO_TOOLS_TOOLSET, kwargs["toolsets"])
+            self.assertTrue(kwargs["no_tools"])
+            self.assertFalse(backend.supports_output_token_limit)
             self.assertEqual("gpt-5.6-terra", kwargs["model"])
             self.assertEqual("xhigh", kwargs["reasoning"])
             self.assertEqual(1, kwargs["max_turns"])
@@ -990,6 +995,32 @@ class HermesTeamBackendTests(unittest.TestCase):
 
 
 class GovernedTeamBackendTests(unittest.TestCase):
+    def test_provider_failure_does_not_start_a_second_app_attempt(self):
+        with temporary_directory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "state.db")
+            state = store.create_run(RunState("RUN-TEAM-PROVIDER-FAIL"))
+
+            class FailedProvider:
+                calls = 0
+
+                def respond_as(self, *_args, **_kwargs):
+                    self.calls += 1
+                    raise HermesExecutionError("provider failed after its own retries",
+                                               usage=TokenUsage(4, 1), category="provider")
+
+            delegate = FailedProvider()
+            backend = GovernedTeamConversationBackend(
+                delegate, BudgetManager(BudgetPolicy(conversation_tokens=1000,
+                                                    retries={"technical_error": 3}), store),
+                response_reserve_tokens=1,
+            )
+            with self.assertRaises(HermesExecutionError):
+                backend.respond_as(state, ContextBundle((), (), (), False, 0),
+                                   incoming(1, "안녕"), RoleId.REVIEW)
+            self.assertEqual(1, delegate.calls)
+            self.assertEqual(5, store.usage_total(state.run_id))
+
     def test_invalid_response_retries_once_and_records_both_model_usages(self):
         with temporary_directory() as directory:
             root = Path(directory)
